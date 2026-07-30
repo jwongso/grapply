@@ -738,6 +738,125 @@ function GenerateTab({ settings, health }) {
 
 // -- Root App ------------------------------------------------------------------
 
+
+// ── Discovery panel ───────────────────────────────────────────────────────────
+// The other half of grapply: instead of you finding a posting, the companion
+// polls ATS APIs for a curated company list, prefilters on your profile, then
+// scores and ranks the survivors. Top matches show here; the full ranked list
+// lives at <companion>/discovery.
+
+function verdictClass(v) {
+  const k = (v || '').toLowerCase();
+  if (k.startsWith('strong')) return 'v-strong';
+  if (k.startsWith('worth'))  return 'v-worth';
+  if (k.startsWith('marg'))   return 'v-marginal';
+  if (k.startsWith('skip'))   return 'v-skip';
+  return 'v-worth';
+}
+
+function DiscoveryPanel({ settings, health }) {
+  const [data,   setData]   = useState(null);
+  const [status, setStatus] = useState(null);
+  const base  = companionUrl(settings);
+  const hdrs  = companionHeaders(settings);
+  const timer = useRef(null);
+
+  const loadResults = useCallback(async () => {
+    try {
+      const r = await fetch(`${base}/discovery/results`, { headers: hdrs });
+      if (r.ok) setData(await r.json());
+    } catch { /* companion down */ }
+  }, [base]);
+
+  const poll = useCallback(async () => {
+    try {
+      const r = await fetch(`${base}/discovery/status`, { headers: hdrs });
+      if (!r.ok) return;
+      const st = await r.json();
+      setStatus(st);
+      if (!st.running && timer.current) {
+        clearInterval(timer.current);
+        timer.current = null;
+        loadResults();
+      }
+    } catch { /* companion down */ }
+  }, [base, loadResults]);
+
+  useEffect(() => {
+    if (!health) return;
+    loadResults();
+    poll();
+    return () => { if (timer.current) clearInterval(timer.current); };
+  }, [health, loadResults, poll]);
+
+  const runScan = async () => {
+    try {
+      const r = await fetch(`${base}/discovery/run?limit=25&rank=true`,
+                            { method: 'POST', headers: hdrs });
+      if (!r.ok) return;
+      setStatus({ running: true, stage: 'starting', done: 0, total: 0 });
+      if (!timer.current) timer.current = setInterval(poll, 1500);
+    } catch { /* companion down */ }
+  };
+
+  if (!health) return null;
+
+  const jobs = (data?.jobs || [])
+    .slice()
+    .sort((a, b) => (a.rank ?? 999) - (b.rank ?? 999)
+                 || (b.llm_score ?? 0) - (a.llm_score ?? 0))
+    .slice(0, 3);
+
+  const running = status?.running;
+  const pct = status?.total ? Math.round(100 * status.done / status.total)
+                            : (running ? 5 : 0);
+
+  return html`
+    <div class="disc-panel">
+      <div class="disc-header">
+        <span class="disc-title">Discovery</span>
+        ${data?.counts?.shortlist != null && html`
+          <span class="pill pill-loading">${data.counts.shortlist} matches</span>`}
+        <button class="btn btn-secondary" style="font-size:10px;padding:4px 9px"
+          disabled=${running} onClick=${runScan}>
+          ${running ? 'Scanning...' : 'Explore'}
+        </button>
+      </div>
+
+      ${running && html`
+        <div>
+          <div class="disc-meta">${status.stage} ${status.done}/${status.total}</div>
+          <div class="disc-progress"><i style="width:${pct}%"></i></div>
+        </div>`}
+
+      ${!running && jobs.length === 0 && html`
+        <div class="disc-empty">
+          No scan yet. Explore polls your configured company list and ranks what fits.
+        </div>`}
+
+      ${jobs.map(j => html`
+        <div class="disc-row" key=${j.id}>
+          <span class="disc-rank">${j.rank ?? ''}</span>
+          <div class="disc-body">
+            <a class="disc-role" href=${j.url} target="_blank" rel="noopener">${j.title}</a>
+            <div class="disc-meta">
+              ${j.company}${j.location ? ' \u00b7 ' + j.location : ''}
+              ${j.llm_score != null ? ' \u00b7 ' + j.llm_score + '/10' : ''}
+            </div>
+          </div>
+          ${j.verdict && html`
+            <span class="disc-verdict ${verdictClass(j.verdict)}">${j.verdict}</span>`}
+        </div>`)}
+
+      ${jobs.length > 0 && html`
+        <button class="btn btn-secondary btn-full"
+          style="font-size:10px;padding:5px;margin-top:8px"
+          onClick=${() => chrome.tabs.create({ url: `${base}/discovery` })}>
+          Open full ranked list
+        </button>`}
+    </div>`;
+}
+
 function App() {
   const [health,   setHealth]   = useState(undefined);
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
@@ -806,6 +925,7 @@ function App() {
       </div>
 
       <${CompanionBanner} health=${health} />
+      <${DiscoveryPanel} settings=${settings} health=${health} />
       <${GenerateTab} settings=${settings} health=${health} />
 
       <div style="padding:10px 14px;border-top:1px solid var(--border);display:flex;gap:8px">

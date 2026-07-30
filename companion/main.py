@@ -1760,3 +1760,244 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Job discovery - the other half of grapply: find postings worth grabbing.
+# CLI equivalent:  python -m companion.discovery --rank
+# ══════════════════════════════════════════════════════════════════════════════
+
+_DISCOVERY_STATE: dict = {"running": False, "stage": "idle", "done": 0,
+                          "total": 0, "error": ""}
+
+
+def _discovery_worker(prefilter_min: float, limit: int,
+                      do_llm: bool, do_rank: bool, include_seen: bool) -> None:
+    import discovery
+    def progress(stage: str, done: int, total: int) -> None:
+        _DISCOVERY_STATE.update(stage=stage, done=done, total=total)
+    try:
+        _DISCOVERY_STATE.update(running=True, stage="starting", done=0,
+                                total=0, error="")
+        discovery.run_scan(prefilter_min=prefilter_min, limit=limit,
+                           do_llm=do_llm, do_rank=do_rank,
+                           include_seen=include_seen, progress=progress)
+    except Exception as exc:                                    # noqa: BLE001
+        logger.exception("[discovery] scan failed")
+        _DISCOVERY_STATE.update(error=str(exc), stage="error")
+    finally:
+        _DISCOVERY_STATE.update(running=False)
+
+
+@app.get("/discovery", response_class=HTMLResponse)
+def discovery_page():
+    token = CFG.get("auth_token", "")
+    return HTMLResponse(content=_DISCOVERY_HTML.replace("%%AUTH_TOKEN%%", token))
+
+
+@app.get("/discovery/results")
+def discovery_results_endpoint():
+    import discovery
+    return discovery.load_last()
+
+
+@app.get("/discovery/status")
+def discovery_status_endpoint():
+    return dict(_DISCOVERY_STATE)
+
+
+@app.get("/discovery/sources")
+def discovery_sources_endpoint():
+    import discovery
+    return {"sources": discovery.load_sources(),
+            "path": str(discovery.SOURCES_PATH)}
+
+
+@app.post("/discovery/run")
+def discovery_run_endpoint(
+    prefilter_min: float = 55.0,
+    limit: int = 25,
+    llm: bool = True,
+    rank: bool = True,
+    include_seen: bool = False,
+    _: None = Depends(_require_token),
+):
+    if _DISCOVERY_STATE["running"]:
+        raise HTTPException(status_code=409, detail="A scan is already running")
+    import threading
+    threading.Thread(
+        target=_discovery_worker,
+        args=(prefilter_min, limit, llm, rank, include_seen),
+        daemon=True,
+    ).start()
+    return {"started": True}
+
+
+_DISCOVERY_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>grapply - Discovery</title>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    :root{--bg:#0f1117;--surface:#1a1d27;--border:#2a2d3a;--accent:#6c63ff;
+          --ok:#4caf7d;--warn:#d8a657;--danger:#e05252;--text:#e8eaf0;--muted:#7b7f96}
+    body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:14px;min-height:100vh}
+    header{padding:20px 32px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+    .logo{font-weight:700;font-size:20px;letter-spacing:-.3px}.logo span{color:var(--accent)}
+    .subtitle{color:var(--muted);font-size:13px}
+    .spacer{flex:1}
+    main{max-width:1180px;margin:0 auto;padding:28px 24px 60px}
+    section{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:20px 22px;margin-bottom:20px}
+    h2{font-size:13px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--muted);margin-bottom:16px;padding-bottom:10px;border-bottom:1px solid var(--border)}
+    button{background:var(--accent);border:0;border-radius:6px;color:#fff;cursor:pointer;font-size:13px;font-weight:600;padding:9px 16px;font-family:inherit}
+    button:disabled{opacity:.45;cursor:not-allowed}
+    button.ghost{background:transparent;border:1px solid var(--border);color:var(--text)}
+    .controls{display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap}
+    .fld label{display:block;font-size:11px;color:var(--muted);margin-bottom:4px}
+    .fld input,.fld select{background:#0f1117;border:1px solid var(--border);border-radius:6px;color:var(--text);padding:7px 9px;font-size:13px;font-family:inherit;width:120px}
+    .chk{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--muted);padding-bottom:8px}
+    .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+    .card{background:#0f1117;border:1px solid var(--border);border-radius:8px;padding:14px 16px}
+    .card .n{font-size:24px;font-weight:700;letter-spacing:-.5px}
+    .card .l{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-top:2px}
+    table{width:100%;border-collapse:collapse;font-size:13px}
+    th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);font-weight:600;padding:8px 10px;border-bottom:1px solid var(--border);white-space:nowrap}
+    td{padding:10px;border-bottom:1px solid var(--border);vertical-align:top}
+    tr:last-child td{border-bottom:0}
+    tr.skip{opacity:.5}
+    a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+    .rank{font-weight:700;color:var(--muted);width:34px}
+    .pill{display:inline-block;font-size:11px;font-weight:600;padding:3px 8px;border-radius:20px;white-space:nowrap}
+    .v-strong{background:rgba(76,175,125,.16);color:var(--ok)}
+    .v-worth{background:rgba(108,99,255,.18);color:#9b95ff}
+    .v-marginal{background:rgba(216,166,87,.16);color:var(--warn)}
+    .v-skip{background:rgba(224,82,82,.14);color:var(--danger)}
+    .why{color:var(--muted);font-size:12px;max-width:340px}
+    .meta{color:var(--muted);font-size:12px}
+    .note{color:var(--warn);font-size:11px;margin-top:4px}
+    .bar{height:5px;background:#0f1117;border-radius:3px;overflow:hidden;margin-top:12px}
+    .bar i{display:block;height:100%;background:var(--accent);width:0;transition:width .3s}
+    .empty{color:var(--muted);text-align:center;padding:34px 0}
+    .hits{color:var(--muted);font-size:11px;margin-top:4px}
+  </style>
+</head>
+<body>
+<header>
+  <div class="logo">gr<span>apply</span></div>
+  <div class="subtitle">Discovery</div>
+  <div class="spacer"></div>
+  <a class="meta" href="/stats">stats</a>
+  <a class="meta" href="/settings">settings</a>
+</header>
+<main>
+  <section>
+    <h2>Scan</h2>
+    <div class="controls">
+      <div class="fld"><label>Prefilter min</label><input id="pf" type="number" value="55" step="5" min="0" max="100"></div>
+      <div class="fld"><label>Max to score</label><input id="lim" type="number" value="25" min="1" max="100"></div>
+      <label class="chk"><input id="llm" type="checkbox" checked> LLM score</label>
+      <label class="chk"><input id="rank" type="checkbox" checked> Rank</label>
+      <label class="chk"><input id="seen" type="checkbox"> Include seen</label>
+      <button id="run">Run scan</button>
+      <button id="refresh" class="ghost">Refresh</button>
+    </div>
+    <div class="bar"><i id="bar"></i></div>
+    <div class="meta" id="status" style="margin-top:8px">idle</div>
+  </section>
+
+  <section>
+    <h2>Last scan</h2>
+    <div class="cards" id="cards"></div>
+    <div class="meta" id="generated" style="margin-top:12px"></div>
+  </section>
+
+  <section>
+    <h2>Shortlist - your call</h2>
+    <div id="tablewrap"><div class="empty">No results yet. Run a scan.</div></div>
+  </section>
+</main>
+<script>
+const TOKEN = '%%AUTH_TOKEN%%';
+const H = TOKEN ? {'X-Grapply-Token': TOKEN} : {};
+const $ = id => document.getElementById(id);
+
+function pill(v){
+  const k = (v||'').toLowerCase();
+  const cls = k.startsWith('strong') ? 'v-strong'
+            : k.startsWith('worth')  ? 'v-worth'
+            : k.startsWith('marg')   ? 'v-marginal'
+            : k.startsWith('skip')   ? 'v-skip' : 'v-worth';
+  return v ? `<span class="pill ${cls}">${v}</span>` : '';
+}
+
+function render(d){
+  const c = d.counts || {}, jobs = d.jobs || [];
+  $('cards').innerHTML = [
+    ['Sources', c.sources ?? '-'], ['Fetched', c.fetched ?? '-'],
+    ['Rejected', c.rejected ?? '-'], ['Shortlist', c.shortlist ?? jobs.length]
+  ].map(([l,n]) => `<div class="card"><div class="n">${n}</div><div class="l">${l}</div></div>`).join('');
+  $('generated').textContent = d.generated ? 'Generated ' + d.generated : '';
+
+  if (!jobs.length){
+    $('tablewrap').innerHTML = '<div class="empty">No results yet. Run a scan.</div>';
+    return;
+  }
+  jobs.sort((a,b) => (a.rank ?? 999) - (b.rank ?? 999)
+                  || (b.llm_score ?? 0) - (a.llm_score ?? 0));
+  const rows = jobs.map(j => {
+    const hits = Object.entries(j.hits || {})
+      .map(([k,v]) => k + ': ' + v.slice(0,4).join(', ')).join(' | ');
+    const notes = (j.notes || []).map(n => `<div class="note">${n}</div>`).join('');
+    const skip = (j.verdict||'').toLowerCase().startsWith('skip') ? ' class="skip"' : '';
+    return `<tr${skip}>
+      <td class="rank">${j.rank ?? ''}</td>
+      <td><a href="${j.url}" target="_blank" rel="noopener">${j.title}</a>
+          <div class="hits">${hits}</div>${notes}</td>
+      <td>${j.company}</td>
+      <td class="meta">${j.location || ''}</td>
+      <td>${(j.llm_score ?? '-')}<span class="meta">/10</span>
+          <div class="meta">pf ${j.prefilter_score ?? '-'}</div></td>
+      <td>${pill(j.verdict)}</td>
+      <td class="why">${j.why || (j.llm && j.llm.recommendation) || ''}</td>
+    </tr>`;
+  }).join('');
+  $('tablewrap').innerHTML = `<table><thead><tr>
+      <th>#</th><th>Role</th><th>Company</th><th>Location</th>
+      <th>Fit</th><th>Verdict</th><th>Why</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+async function loadResults(){
+  const d = await fetch('/discovery/results', {headers:H}).then(r=>r.json());
+  render(d);
+}
+
+let poll = null;
+async function tick(){
+  const s = await fetch('/discovery/status', {headers:H}).then(r=>r.json());
+  const pct = s.total ? Math.round(100 * s.done / s.total) : (s.running ? 5 : 0);
+  $('bar').style.width = pct + '%';
+  $('status').textContent = s.error ? ('error: ' + s.error)
+    : s.running ? `${s.stage} ${s.done}/${s.total}` : 'idle';
+  $('run').disabled = s.running;
+  if (!s.running && poll){ clearInterval(poll); poll = null; loadResults(); }
+}
+
+$('run').onclick = async () => {
+  const q = new URLSearchParams({
+    prefilter_min: $('pf').value, limit: $('lim').value,
+    llm: $('llm').checked, rank: $('rank').checked,
+    include_seen: $('seen').checked });
+  const r = await fetch('/discovery/run?' + q, {method:'POST', headers:H});
+  if (!r.ok){ $('status').textContent = 'error: ' + (await r.text()); return; }
+  $('run').disabled = true;
+  if (!poll) poll = setInterval(tick, 1500);
+  tick();
+};
+$('refresh').onclick = loadResults;
+
+loadResults(); tick();
+</script>
+</body>
+</html>"""
