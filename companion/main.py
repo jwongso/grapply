@@ -1905,6 +1905,11 @@ _DISCOVERY_HTML = """<!DOCTYPE html>
     .fld label{display:block;font-size:11px;color:var(--muted);margin-bottom:4px}
     .fld input,.fld select{background:#0f1117;border:1px solid var(--border);border-radius:6px;color:var(--text);padding:7px 9px;font-size:13px;font-family:inherit;width:120px}
     .chk{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--muted);padding-bottom:8px}
+    .hint{font-size:11px;color:var(--muted);line-height:1.45;margin-top:3px;max-width:190px}
+    .opt{display:flex;flex-direction:column;gap:1px;margin-bottom:9px}
+    .opt .chk{padding-bottom:0}
+    .opt .hint{max-width:none;margin-left:22px}
+    .warn{color:var(--warn)}
     .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
     .card{background:#0f1117;border:1px solid var(--border);border-radius:8px;padding:14px 16px}
     .card .n{font-size:24px;font-weight:700;letter-spacing:-.5px}
@@ -1941,27 +1946,60 @@ _DISCOVERY_HTML = """<!DOCTYPE html>
 <main>
   <section>
     <h2>Scan</h2>
+    <div class="meta" style="margin-bottom:14px">
+      Searches job boards, throws away what does not fit your CV, and hands you
+      a short list. It only reads and ranks - it never applies for anything.
+    </div>
     <div class="controls">
-      <div class="fld"><label>Prefilter min</label><input id="pf" type="number" value="55" step="5" min="0" max="100"></div>
-      <div class="fld"><label>Max to score</label><input id="lim" type="number" value="25" min="1" max="100"></div>
-      <label class="chk"><input id="llm" type="checkbox" checked> LLM score</label>
-      <label class="chk"><input id="rank" type="checkbox" checked> Rank</label>
-      <label class="chk"><input id="seen" type="checkbox"> Include seen</label>
-      <button id="run">Run scan</button>
-      <button id="refresh" class="ghost">Refresh</button>
+      <div class="fld">
+        <label for="pf">How picky? (0-100)</label>
+        <input id="pf" type="number" value="55" step="5" min="0" max="100">
+        <div class="hint">A job must score at least this on keyword matching
+          to survive. Lower finds more jobs but more rubbish. 45-55 is sensible.</div>
+      </div>
+      <div class="fld">
+        <label for="lim">How many to read closely</label>
+        <input id="lim" type="number" value="25" min="1" max="100">
+        <div class="hint">Only the best this-many get read by the AI, because
+          that part is slow. 25 takes a couple of minutes.</div>
+      </div>
+      <div style="min-width:280px">
+        <div class="opt">
+          <label class="chk" for="llm"><input id="llm" type="checkbox" checked>
+            Have the AI read each job</label>
+          <div class="hint">Scores fit out of 10 and names your gaps.</div>
+        </div>
+        <div class="opt">
+          <label class="chk" for="rank"><input id="rank" type="checkbox" checked>
+            Have the AI put them in order</label>
+          <div class="hint warn">Needs a big model. On the 8B one you are
+            running it grades everything "strong" and skips numbers - leave
+            this off until you point it at something larger.</div>
+        </div>
+        <div class="opt">
+          <label class="chk" for="seen"><input id="seen" type="checkbox" checked>
+            Include jobs I have already seen</label>
+          <div class="hint">Off means only brand-new postings. A job you have
+            not applied to is still worth seeing, so this is normally on.</div>
+        </div>
+      </div>
+      <div style="display:flex;gap:10px;align-items:center">
+        <button id="run">Run scan</button>
+        <button id="refresh" class="ghost">Refresh</button>
+      </div>
     </div>
     <div class="bar"><i id="bar"></i></div>
     <div class="meta" id="status" style="margin-top:8px">idle</div>
   </section>
 
   <section>
-    <h2>Search keywords</h2>
+    <h2>What to search for</h2>
     <div class="meta" style="margin-bottom:10px">
-      One per line. Used for every source that takes a query - Seek and the
-      browser-driven boards. The company registry and the remote aggregators
-      list everything they have, so keywords do not narrow those.
-      Each keyword is a separate paginated search, so more terms means a
-      longer scan.
+      Type the job titles you want, one per line - the same words you would
+      type into a job site. These are used on Seek and Indeed. The company
+      career pages and the remote job feeds are read in full instead, so these
+      words do not limit those.
+      <br>Each line is a separate search, so more lines means a longer scan.
     </div>
     <div id="phases"></div>
     <div style="display:flex;gap:10px;align-items:center;margin-top:12px">
@@ -1999,10 +2037,19 @@ function pill(v){
 function render(d){
   const c = d.counts || {}, jobs = d.jobs || [];
   $('cards').innerHTML = [
-    ['Sources', c.sources ?? '-'], ['Fetched', c.fetched ?? '-'],
-    ['Rejected', c.rejected ?? '-'], ['Shortlist', c.shortlist ?? jobs.length]
-  ].map(([l,n]) => `<div class="card"><div class="n">${n}</div><div class="l">${l}</div></div>`).join('');
-  $('generated').textContent = d.generated ? 'Generated ' + d.generated : '';
+    ['Jobs looked at', c.fetched ?? '-',
+     'Every posting pulled from every site'],
+    ['Did not fit', c.rejected ?? '-',
+     'Wrong language, wrong place, or not a software job'],
+    ['Worth a look', c.survivors ?? '-',
+     'Passed the checks against your CV'],
+    ['On your list', c.shortlist ?? jobs.length,
+     'The best of those, shown below'],
+  ].map(([l,n,h]) => `<div class="card" title="${h}"><div class="n">${n}</div>` +
+                     `<div class="l">${l}</div>` +
+                     `<div class="hint" style="margin-top:5px">${h}</div></div>`).join('');
+  $('generated').textContent = d.generated
+    ? 'Last run ' + new Date(d.generated).toLocaleString() : '';
 
   if (!jobs.length){
     $('tablewrap').innerHTML = '<div class="empty">No results yet. Run a scan.</div>';
@@ -2073,14 +2120,21 @@ function renderPhases(){
       <label class="chk" style="padding:0 0 6px">
         <input type="checkbox" data-en="${i}" ${p.enabled !== false ? 'checked' : ''}>
         <b style="color:var(--text)">${p.name}</b>
-        <span class="meta">&nbsp;gate: ${p.gate || 'none'}${
-          (p.browser_profiles||[]).length ? ' · browser: ' + p.browser_profiles.join(', ') : ''}</span>
+        <span class="meta">&nbsp;${
+          p.gate === 'nz' ? 'keeps only jobs you could do from New Zealand'
+        : p.gate === 'remote' ? 'keeps only fully remote jobs'
+        : 'keeps everything'}${
+          (p.browser_profiles||[]).length
+            ? ' · opens a browser for ' + p.browser_profiles
+                .map(s => s.replace('-nz','').replace(/^./, m => m.toUpperCase()))
+                .join(', ')
+            : ''}</span>
       </label>
       <textarea data-kw="${i}" rows="${Math.max(3,(p.keywords||[]).length+1)}"
         style="width:100%;background:#0f1117;border:1px solid var(--border);
                border-radius:6px;color:var(--text);padding:8px 10px;
                font-size:13px;font-family:inherit;resize:vertical"
-        >${(p.keywords||[]).join('\n')}</textarea>
+        >${(p.keywords||[]).join('\\n')}</textarea>
     </div>`).join('');
 }
 
@@ -2097,7 +2151,7 @@ $('savekw').onclick = async () => {
   if (!CFG) return;
   document.querySelectorAll('[data-kw]').forEach(t => {
     const i = +t.dataset.kw;
-    CFG.phases[i].keywords = t.value.split('\n')
+    CFG.phases[i].keywords = t.value.split('\\n')
       .map(s => s.trim()).filter(Boolean);
   });
   document.querySelectorAll('[data-en]').forEach(c => {
