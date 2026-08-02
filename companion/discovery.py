@@ -146,6 +146,57 @@ NZ_TERMS = ("new zealand", "auckland", "wellington", "christchurch",
 REMOTE_TERMS = ("remote", "anywhere", "worldwide", "global", "distributed",
                 "work from home", "wfh", "fully remote", "remote-first")
 
+# "Remote" on a remote job board almost never means "remote from anywhere".
+# Measured across 512 aggregator postings: only 8 said Worldwide and 6 Global,
+# while 73 were US-only, 16 EMEA, and many named a single city. Every one of
+# them still arrived with remote=True, so the flag alone is worthless as a gate.
+
+# Generic words that describe the arrangement but name no place. A location
+# made only of these is unrestricted as far as we can tell.
+REMOTE_GENERIC = ("remote", "fully remote", "remote-first", "remote only",
+                  "distributed", "work from home", "wfh", "homeoffice",
+                  "home office", "telecommute", "anywhere", "flexible")
+
+# Places a New Zealand resident can actually work from. Australia counts: he
+# has no AU work rights, but contracting remotely from NZ into an AU company
+# is the arrangement job_target_list.md already plans for.
+NZ_REACHABLE_REGIONS = (
+    "worldwide", "global", "anywhere", "international",
+    "new zealand", "nz", "aotearoa", "auckland", "wellington", "christchurch",
+    "apac", "asia pacific", "asia-pacific", "oceania", "australia", "sydney",
+    "melbourne", "brisbane", "perth",
+)
+
+# Phrases in the body that gate on work authorisation he does not hold. These
+# are stronger evidence than the location string, which is often just a
+# head-office address.
+# A board serves a market, and a posting with a blank or generic location
+# inherits it. Arbeitnow is a German board: its "Homeoffice" and blank-location
+# postings are Germany-based roles wanting EU work rights, and they sailed
+# through the location gate until this was added. Language markers in the title
+# ("(m/w/d)", "(m/f/d)") corroborate it.
+#
+# Germany is a real future market for him - job_target_list.md plans a 2028
+# return - but not one he can work in now, so it is a reject with a reason
+# rather than a silent drop.
+SOURCE_DEFAULT_REGION = {
+    "arbeitnow": "Germany",
+}
+
+WORK_AUTH_BLOCK = (
+    "must be authorized to work in the us",
+    "must be authorised to work in the us",
+    "must be legally authorized to work in the united states",
+    "us work authorization required",
+    "eligible to work in the us",
+    "eligible to work in the uk",
+    "must reside in the united states",
+    "must be based in the us",
+    "must be located in the united states",
+    "right to work in the uk",
+    "eu work permit",
+)
+
 WEIGHTS: dict[str, tuple[int, tuple[str, ...]]] = {
     # Language buckets are weighted by preference, not by capability: C++ is
     # the deepest and best-evidenced, C#/.NET is real production experience,
@@ -393,9 +444,37 @@ def _location_ok(job: dict, gate: str) -> tuple[bool, str]:
         return False, f"not NZ-reachable: {job.get('location') or '?'}"
 
     if gate == "remote":
-        if is_remote or _any(body[:1500], REMOTE_TERMS):
+        if not (is_remote or _any(body[:1500], REMOTE_TERMS)):
+            return False, f"not remote: {job.get('location') or '?'}"
+
+        # Remote, but remote from where? An explicit work-authorisation demand
+        # settles it regardless of what the location says.
+        auth = next((t for t in WORK_AUTH_BLOCK if t in body), "")
+        if auth:
+            return False, f"needs work rights he lacks ('{auth}')"
+
+        if _any(loc, NZ_REACHABLE_REGIONS):
             return True, ""
-        return False, f"not remote: {job.get('location') or '?'}"
+
+        # Strip the arrangement words. Whatever survives is a place, and since
+        # it did not match the reachable list, it is a place he cannot work
+        # from. Inverting the test this way rejects unknown regions by default
+        # rather than needing every country enumerated.
+        residue = loc
+        for term in REMOTE_GENERIC:
+            residue = residue.replace(term, " ")
+        residue = re.sub(r"[^a-z0-9]+", " ", residue).strip()
+        if residue:
+            return False, (f"remote but region-locked: "
+                           f"{job.get('location') or '?'}")
+
+        # Nothing but arrangement words, or blank. Before calling it
+        # unrestricted, fall back to the board's own market.
+        home = SOURCE_DEFAULT_REGION.get(job.get("source", ""))
+        if home and not _any(home.lower(), NZ_REACHABLE_REGIONS):
+            return False, (f"{job.get('source')} is a {home} board and this "
+                           f"posting names no region - assuming {home}")
+        return True, ""
 
     return True, ""
 

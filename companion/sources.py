@@ -137,11 +137,35 @@ def strip_html(raw: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", txt).strip()
 
 
+def unmojibake(s: str) -> str:
+    """Repair UTF-8 text that was decoded as Latin-1 upstream.
+
+    Some feeds ship already-broken text - RemoteOK serves an em-dash as the
+    literal characters "a EUR ..." rather than the character itself. Text that
+    round-trips cleanly back through Latin-1 into valid UTF-8 was mojibake;
+    anything else is left alone, so genuine Latin-1 content is not harmed.
+    """
+    for _ in range(3):          # some feeds are doubly encoded
+        if not s or s.isascii():
+            return s
+        try:
+            repaired = s.encode("latin-1").decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            return s
+        if repaired == s:
+            return s
+        s = repaired
+    return s
+
+
 def _job(**kw: Any) -> dict:
     base = {"id": "", "source": "", "company": "", "title": "", "location": "",
             "url": "", "posted": "", "description": "", "salary": "",
             "remote": None}
     base.update(kw)
+    for field in ("title", "company", "location", "description"):
+        if isinstance(base.get(field), str):
+            base[field] = unmojibake(base[field])
     return base
 
 
