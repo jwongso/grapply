@@ -16,6 +16,13 @@ Sites are described declaratively in SITE_PROFILES: a start URL, a pattern for
 the interesting responses, and a field mapping. Adding a board is a data change,
 not a new scraper. One engine drives all of them.
 
+Before adding a profile, check the site's terms of service, and prefer a public
+API where one exists. A Trade Me profile was removed for this reason: its data
+sat behind an authenticated endpoint, working around that is not something to
+automate, and Seek's public API already returns far more New Zealand postings.
+A profile that has to defeat an access control is the signal to stop, not a
+problem to solve.
+
 Playwright is an optional dependency. If it is missing, available() reports
 False and callers fall back to the JSON sources rather than failing the scan.
 
@@ -685,39 +692,6 @@ SITE_PROFILES: dict[str, dict] = {
                 "to capture. Its JSON API is public - sources.seek_search() "
                 "gets the same data far faster.",
     },
-    "trademe": {
-        "label": "Trade Me Jobs",
-        "url": lambda kw, page: (
-            "https://www.trademe.co.nz/a/jobs/search?search_string="
-            f"{kw.replace(' ', '%20')}&page={page}"),
-        # Angular SPA. api.trademe.co.nz/v1/search/jobs.json is 401 to a plain
-        # client but is called successfully by the page itself, so capture it
-        # rather than trying to authenticate.
-        # Two feeds carry jobs: the search results and the landing-page
-        # recommendations (which come with descriptions). The search call is
-        # intermittent under automation, the recommendations call is reliable,
-        # so read both and let the prefilter sort them out.
-        "capture": (r"api\.trademe\.co\.nz/v1/"
-                    r"(search/jobs|jobs/listings/recommendations)\.json"),
-        "warmup": "https://www.trademe.co.nz/a/jobs",
-        "settle": 6.0,
-        "rows": ["List", "JobListings"],
-        # Confirmed by live capture: envelope is
-        # {TotalCount, Page, PageSize, List, ...}. The row fields below are
-        # Trade Me's documented listing shape but were NOT confirmed - the
-        # follow-up captures returned no rows, so verify with --dump before
-        # trusting them.
-        "map": {"ext_id": "ListingId", "title": "Title",
-                "company": "Subtitle", "location": "Region",
-                "salary": "PayAndBenefits", "posted": "StartDate",
-                "description": "ShortDescription"},
-        "url_tpl": "https://www.trademe.co.nz/a/jobs/listing/{ext_id}",
-        "scroll_passes": 3,
-        "note": "Unreliable under automation. One capture returned the full "
-                "API sequence; repeat runs returned only ad JSON, so the site "
-                "appears to serve a different path to repeat automated "
-                "visits. Treat as best-effort.",
-    },
     "zeil": {
         "label": "Zeil",
         "url": lambda kw, page: (
@@ -973,7 +947,6 @@ def fetch_profiles(names: Iterable[str], keywords: str, *,
 LOGIN_URLS = {
     "indeed-nz": "https://nz.indeed.com/account/login",
     "seek-nz":   "https://www.seek.co.nz/oauth/login/",
-    "trademe":   "https://www.trademe.co.nz/a/login",
     "zeil":      "https://www.zeil.com/login",
 }
 
