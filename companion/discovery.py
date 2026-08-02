@@ -542,7 +542,9 @@ def dedupe(jobs: list[dict]) -> list[dict]:
 
 def gather_phase(phase: dict, cfg: dict, registry: list[dict],
                  log: Callable[[str], None],
-                 registry_jobs: list[dict] | None = None) -> list[dict]:
+                 registry_jobs: list[dict] | None = None,
+                 tick: Callable[[str, int, int], None] | None = None,
+                 ) -> list[dict]:
     """Fetch every source a phase asks for. Never raises for one bad source.
 
     registry_jobs lets the caller poll the company registry once and share it
@@ -551,6 +553,12 @@ def gather_phase(phase: dict, cfg: dict, registry: list[dict],
     """
     jobs: list[dict] = []
     gate = phase.get("gate", "")
+
+    # A phase is minutes of work, so reporting only "phase 1 of 2" leaves the
+    # progress bar frozen and looking crashed. Report the sub-steps instead.
+    def step(msg: str, done: int = 0, total: int = 0) -> None:
+        if tick:
+            tick(msg, done, total)
 
     if phase.get("use_registry", True) and registry:
         if registry_jobs is None:
@@ -568,7 +576,9 @@ def gather_phase(phase: dict, cfg: dict, registry: list[dict],
         # and ~150 for the same result.
         per_kw: list[list[dict]] = []
         seen_ids: set[str] = set()
-        for kw in phase.get("keywords", []):
+        kws = phase.get("keywords", [])
+        for n, kw in enumerate(kws, 1):
+            step(f"Searching Seek for \"{kw}\"", n - 1, len(kws))
             try:
                 stubs = src_mod.seek_search(
                     kw, site=site, max_jobs=phase.get("max_jobs", 300))
@@ -594,13 +604,25 @@ def gather_phase(phase: dict, cfg: dict, registry: list[dict],
         todo = pool[: cfg.get("hydrate_limit", 320)]
         if todo:
             log(f"  seek-{site}: hydrating {len(todo)} unique postings")
-            todo = src_mod.seek_hydrate(todo, site=site)
+            # The slowest part of a scan by far - one request per posting - so
+            # it is the part that most needs to visibly move.
+            todo = src_mod.seek_hydrate(
+                todo, site=site,
+                progress=lambda d, t: step(
+                    f"Reading job descriptions from Seek", d, t))
         jobs.extend(todo)
 
     aggs = phase.get("aggregators", [])
     if aggs:
-        got = src_mod.fetch_aggregators(
-            aggs, on_source=lambda n, c: log(f"    {n}: {c}"))
+        done = [0]
+
+        def agg_done(name: str, count: int) -> None:
+            done[0] += 1
+            log(f"    {name}: {count}")
+            step(f"Reading remote job feeds ({name})", done[0], len(aggs))
+
+        step("Reading remote job feeds", 0, len(aggs))
+        got = src_mod.fetch_aggregators(aggs, on_source=agg_done)
         log(f"  aggregators: {len(got)}")
         jobs.extend(got)
 
@@ -622,13 +644,18 @@ def gather_phase(phase: dict, cfg: dict, registry: list[dict],
             # first one's results. One keyword by default; raise it only if a
             # site genuinely partitions its index by query.
             for kw in phase.get("keywords", [])[:phase.get("browser_keywords", 1)]:
+                pages = phase.get("browser_pages", 4)
+                step(f"Opening a browser for {', '.join(profiles)}", 0, pages)
                 try:
                     got = render.fetch_profiles(
                         profiles, kw, max_jobs=phase.get("max_jobs", 100),
-                        max_pages=phase.get("browser_pages", 4),
+                        max_pages=pages,
                         headless=cfg.get("headless", True),
                         engine=cfg.get("browser_engine", "rotate"),
-                        device=cfg.get("browser_device", "desktop"))
+                        device=cfg.get("browser_device", "desktop"),
+                        on_page=lambda site, n, fresh, total: step(
+                            f"Reading {site} page {n} ({total} jobs so far)",
+                            n, pages))
                 except Exception as exc:                         # noqa: BLE001
                     log(f"  browser '{kw}': failed ({exc})")
                     continue
@@ -796,17 +823,24 @@ def run_scan(prefilter_min: float | None = None, limit: int | None = None,
     # results, not in what the ATS boards return.
     registry_jobs: list[dict] | None = None
     if registry and any(p.get("use_registry", True) for p in phases):
-        tick("fetching: registry", 0, len(phases))
-        registry_jobs = src_mod.fetch_registry(registry)
+        done = [0]
+
+        def reg_done(name: str, count: int) -> None:
+            done[0] += 1
+            tick(f"Reading company career pages ({name})",
+                 done[0], len(registry))
+
+        tick("Reading company career pages", 0, len(registry))
+        registry_jobs = src_mod.fetch_registry(registry, on_source=reg_done)
         log(f"registry: {len(registry_jobs)} postings from "
             f"{len(registry)} companies")
 
     for idx, phase in enumerate(phases, 1):
         name = phase.get("name", f"phase {idx}")
-        tick(f"fetching: {name}", idx - 1, len(phases))
+        tick(f"{name}: starting", 0, 1)
         log(f"\n[{idx}/{len(phases)}] {name}")
 
-        raw = gather_phase(phase, cfg, registry, log, registry_jobs)
+        raw = gather_phase(phase, cfg, registry, log, registry_jobs, tick)
         raw = [j for j in raw if j["id"] not in hidden]
         all_jobs.extend(raw)
 
@@ -832,16 +866,18 @@ def run_scan(prefilter_min: float | None = None, limit: int | None = None,
     for j in survivors:
         j["is_new"] = j["id"] not in seen
     survivors.sort(key=lambda x: (not x["is_new"], -x["prefilter_score"]))
-    tick("prefiltered", len(survivors), len(all_jobs))
+    tick(f"Checking {len(survivors)} jobs against your CV",
+         len(survivors), len(survivors))
 
     shortlist = survivors[:limit]
     if do_llm and shortlist:
         _, _, config = _ai_bits()
         if config.load_resume_text(config.load()).strip():
             llm_score(shortlist, verbose=False,
-                      progress=lambda d, t: tick("scoring", d, t))
+                      progress=lambda d, t: tick(
+                          "AI reading job descriptions", d, t))
             if do_rank and len(shortlist) > 1:
-                tick("ranking", 0, len(shortlist))
+                tick("AI putting them in order", 0, len(shortlist))
                 shortlist = rank_candidates(shortlist, verbose=False)
         else:
             log("!! no resume text - skipping LLM stage")
@@ -868,7 +904,7 @@ def run_scan(prefilter_min: float | None = None, limit: int | None = None,
     }
     LAST_PATH.parent.mkdir(parents=True, exist_ok=True)
     LAST_PATH.write_text(json.dumps(payload, indent=2))
-    tick("done", len(slim), len(slim))
+    tick(f"Done - {len(slim)} jobs on your list", 1, 1)
     return payload
 
 

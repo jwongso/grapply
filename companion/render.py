@@ -787,6 +787,7 @@ def fetch_profile(name: str, keywords: str, *, max_jobs: int = 100,
                   engine: str = "chromium", device: str = "desktop",
                   session: BrowserSession | None = None,
                   on_payload: Callable[[str, Any], None] | None = None,
+                  on_page: Callable[[str, int, int, int], None] | None = None,
                   ) -> list[dict]:
     """Run one site profile and return normalised job dicts.
 
@@ -816,6 +817,8 @@ def fetch_profile(name: str, keywords: str, *, max_jobs: int = 100,
     if dom_spec:
         def page_note(n: int, fresh: int, total: int) -> None:
             print(f"    page {n}: +{fresh} (total {total})", file=sys.stderr)
+            if on_page:
+                on_page(name, n, fresh, total)
 
         try:
             rows = sess.harvest_dom(
@@ -922,7 +925,9 @@ def fetch_profile(name: str, keywords: str, *, max_jobs: int = 100,
 def fetch_profiles(names: Iterable[str], keywords: str, *,
                    max_jobs: int = 100, max_pages: int = 4,
                    headless: bool = True, engine: str = "rotate",
-                   device: str = "desktop") -> list[dict]:
+                   device: str = "desktop",
+                   on_page: Callable[[str, int, int, int], None] | None = None,
+                   ) -> list[dict]:
     """Run several profiles, one browser per site.
 
     engine='rotate' cycles chromium/firefox/webkit across sites; pass a single
@@ -954,7 +959,8 @@ def fetch_profiles(names: Iterable[str], keywords: str, *,
             with BrowserSession(headless=head, engine=eng,
                                 device=dev) as sess:
                 got = fetch_profile(n, keywords, max_jobs=max_jobs,
-                                    max_pages=max_pages, session=sess)
+                                    max_pages=max_pages, session=sess,
+                                    on_page=on_page)
             print(f"  {n:<12} {eng:<9} {dev:<8} "
                   f"{'headed' if not head else 'headless':<8} "
                   f"{len(got):>4} jobs", file=sys.stderr)
