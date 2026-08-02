@@ -88,6 +88,42 @@ TITLE_REJECT_ROLE = (
     "quantitative trader", "hr ",
 )
 
+# Engineering disciplines that are not software engineering. TITLE_REQUIRE_ANY
+# accepts "engineer" and "lead" on their own, which at an aerospace employer
+# matches the entire mechanical and RF organisation - a scan of Rocket Lab
+# surfaced Team Lead CFD, Thermofluids Analysis, Senior Vibrations Engineer and
+# RF Ground Segment, none of which are software roles. Their job descriptions
+# legitimately mention Python and Linux, so only the title distinguishes them.
+#
+# FPGA and ASIC are here rather than in PENALTIES because a title-level match
+# means the role IS hardware description work, not a role that merely touches
+# it - that is a stated gap, not a discount.
+SOFTWARE_TITLE_TERMS = (
+    "software", "developer", "programmer", "firmware", "embedded",
+    "backend", "back-end", "frontend", "front-end", "full stack",
+    "full-stack", "devops", "sre", "platform", "application", "web",
+    "cloud", "data engineer", "machine learning", "ml engineer",
+)
+
+# Trailing "*" marks a prefix, which most of these need - titles pluralise
+# ("Thermofluids Analysis", "Senior Vibrations Engineer") and a whole-word
+# match silently misses them.
+TITLE_REJECT_DISCIPLINE = (
+    "cfd", "thermofluid*", "thermal", "vibration*", "dynamics", "structural",
+    "mechanical", "propulsion", "aerodynamic*", "aerothermal", "stress",
+    "fatigue", "material*", "metallurg*", "manufacturing", "machinist",
+    "welding", "composite*", "tooling", "fixture",
+    "qualification", "hardware test", "test technician",
+    "rf ", "radio frequency", "antenna*", "microwave", "photonic*", "optical",
+    "electrical", "electronic*", "chemical", "civil", "mechatronic*",
+    "avionics hardware",
+)
+
+# Hardware description work. Kept separate because these must NOT be rescued by
+# a software word in the title: "FPGA Developer" is exactly the role being
+# excluded, and Verilog/VHDL are a stated gap rather than a discount.
+TITLE_REJECT_HARDWARE = ("fpga", "asic", "verilog", "vhdl", "pcb", "rtl design")
+
 HARD_BLOCK = (
     "security clearance", "ts/sci", "must be a u.s. citizen",
     "must be a us citizen", "us citizenship is required",
@@ -381,6 +417,15 @@ def prefilter(job: dict, gate: str = "") -> dict:
         reject.append(f"title is not an engineering role: {job['title']}")
     if _any(title, TITLE_REJECT_ROLE):
         reject.append(f"non-engineering role type: {job['title']}")
+    hw = next((t for t in TITLE_REJECT_HARDWARE if _has(title, t)), "")
+    if hw:
+        reject.append(f"hardware description role ('{hw}'): {job['title']}")
+    hit = next((t for t in TITLE_REJECT_DISCIPLINE if _has(title, t)), "")
+    if hit and not _any(title, SOFTWARE_TITLE_TERMS):
+        # "Embedded Software Engineer, RF Systems" is still a software role, so
+        # an explicit software word in the title overrides the discipline hit.
+        reject.append(f"non-software discipline ('{hit.strip('* ')}'): "
+                      f"{job['title']}")
 
     opening = body[:1200]
     for t in BODY_LEVEL_REJECT:

@@ -1955,6 +1955,23 @@ _DISCOVERY_HTML = """<!DOCTYPE html>
   </section>
 
   <section>
+    <h2>Search keywords</h2>
+    <div class="meta" style="margin-bottom:10px">
+      One per line. Used for every source that takes a query - Seek and the
+      browser-driven boards. The company registry and the remote aggregators
+      list everything they have, so keywords do not narrow those.
+      Each keyword is a separate paginated search, so more terms means a
+      longer scan.
+    </div>
+    <div id="phases"></div>
+    <div style="display:flex;gap:10px;align-items:center;margin-top:12px">
+      <button id="savekw">Save keywords</button>
+      <button id="resetkw" class="ghost">Reload</button>
+      <span class="meta" id="kwstatus"></span>
+    </div>
+  </section>
+
+  <section>
     <h2>Last scan</h2>
     <div class="cards" id="cards"></div>
     <div class="meta" id="generated" style="margin-top:12px"></div>
@@ -2044,7 +2061,59 @@ $('run').onclick = async () => {
 };
 $('refresh').onclick = loadResults;
 
-loadResults(); tick();
+// ── keyword editor ──────────────────────────────────────────────────────────
+// Phases are edited in place and written back whole, so anything the UI does
+// not expose (gates, source lists, limits) survives a save untouched.
+let CFG = null;
+
+function renderPhases(){
+  if (!CFG) return;
+  $('phases').innerHTML = CFG.phases.map((p, i) => `
+    <div style="margin-bottom:14px">
+      <label class="chk" style="padding:0 0 6px">
+        <input type="checkbox" data-en="${i}" ${p.enabled !== false ? 'checked' : ''}>
+        <b style="color:var(--text)">${p.name}</b>
+        <span class="meta">&nbsp;gate: ${p.gate || 'none'}${
+          (p.browser_profiles||[]).length ? ' · browser: ' + p.browser_profiles.join(', ') : ''}</span>
+      </label>
+      <textarea data-kw="${i}" rows="${Math.max(3,(p.keywords||[]).length+1)}"
+        style="width:100%;background:#0f1117;border:1px solid var(--border);
+               border-radius:6px;color:var(--text);padding:8px 10px;
+               font-size:13px;font-family:inherit;resize:vertical"
+        >${(p.keywords||[]).join('\n')}</textarea>
+    </div>`).join('');
+}
+
+async function loadConfig(){
+  try{
+    const d = await fetch('/discovery/config', {headers:H}).then(r=>r.json());
+    CFG = d.config; renderPhases();
+    $('kwstatus').textContent = d.browser && d.browser.available
+      ? '' : 'browser sources unavailable (playwright not installed)';
+  }catch(e){ $('kwstatus').textContent = 'could not load config'; }
+}
+
+$('savekw').onclick = async () => {
+  if (!CFG) return;
+  document.querySelectorAll('[data-kw]').forEach(t => {
+    const i = +t.dataset.kw;
+    CFG.phases[i].keywords = t.value.split('\n')
+      .map(s => s.trim()).filter(Boolean);
+  });
+  document.querySelectorAll('[data-en]').forEach(c => {
+    CFG.phases[+c.dataset.en].enabled = c.checked;
+  });
+  $('kwstatus').textContent = 'saving...';
+  const r = await fetch('/discovery/config',
+    {method:'POST', headers:{...H,'Content-Type':'application/json'},
+     body: JSON.stringify({config: CFG})});
+  $('kwstatus').textContent = r.ok
+    ? 'saved - applies to the next scan'
+    : 'save failed: ' + (await r.text()).slice(0,90);
+};
+$('resetkw').onclick = loadConfig;
+
+loadResults(); tick(); loadConfig();
 </script>
 </body>
 </html>"""
