@@ -6,3 +6,8 @@ mcp>=1.0.0
 pypdf>=4.0.0
 # tomllib is built-in on Python 3.11+; tomli provides it for 3.10 and below
 tomli>=2.0.0; python_version < "3.11"
+
+# Optional: browser-backed sources (Indeed and other SPA/blocked boards).
+# Discovery degrades gracefully to the JSON sources when this is absent.
+#   pip install playwright && playwright install chromium
+playwright>=1.44.0

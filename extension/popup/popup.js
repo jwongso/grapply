@@ -757,6 +757,7 @@ function verdictClass(v) {
 function DiscoveryPanel({ settings, health }) {
   const [data,   setData]   = useState(null);
   const [status, setStatus] = useState(null);
+  const [error,  setError]  = useState('');
   const base  = companionUrl(settings);
   const hdrs  = companionHeaders(settings);
   const timer = useRef(null);
@@ -774,6 +775,7 @@ function DiscoveryPanel({ settings, health }) {
       if (!r.ok) return;
       const st = await r.json();
       setStatus(st);
+      if (st.error) setError(st.error);
       if (!st.running && timer.current) {
         clearInterval(timer.current);
         timer.current = null;
@@ -790,13 +792,24 @@ function DiscoveryPanel({ settings, health }) {
   }, [health, loadResults, poll]);
 
   const runScan = async () => {
+    setError('');
     try {
-      const r = await fetch(`${base}/discovery/run?limit=25&rank=true`,
+      const r = await fetch(`${base}/discovery/run?rank=true`,
                             { method: 'POST', headers: hdrs });
-      if (!r.ok) return;
+      if (!r.ok) {
+        // Silently swallowing this was why a failed scan looked identical to
+        // "nothing new" - the stale list just stayed on screen.
+        const detail = await r.text().catch(() => '');
+        setError(r.status === 409 ? 'A scan is already running'
+               : r.status === 401 ? 'Auth token rejected - check Settings'
+               : `Scan failed (${r.status}) ${detail.slice(0, 80)}`);
+        return;
+      }
       setStatus({ running: true, stage: 'starting', done: 0, total: 0 });
       if (!timer.current) timer.current = setInterval(poll, 1500);
-    } catch { /* companion down */ }
+    } catch {
+      setError('Companion unreachable');
+    }
   };
 
   if (!health) return null;
@@ -829,9 +842,20 @@ function DiscoveryPanel({ settings, health }) {
           <div class="disc-progress"><i style="width:${pct}%"></i></div>
         </div>`}
 
-      ${!running && jobs.length === 0 && html`
+      ${error && html`
+        <div class="disc-empty" style="color:#e05252">${error}</div>`}
+
+      ${!running && jobs.length === 0 && !error && html`
         <div class="disc-empty">
-          No scan yet. Explore polls your configured company list and ranks what fits.
+          No results yet. Explore sweeps NZ first, then remote worldwide.
+        </div>`}
+
+      ${data?.generated && html`
+        <div class="disc-meta" style="margin-top:2px">
+          last scan ${new Date(data.generated).toLocaleString()}
+          ${data.counts?.fetched != null
+            ? ` · ${data.counts.fetched} scanned` : ''}
+          ${data.counts?.new ? ` · ${data.counts.new} new` : ''}
         </div>`}
 
       ${jobs.map(j => html`
@@ -848,12 +872,11 @@ function DiscoveryPanel({ settings, health }) {
             <span class="disc-verdict ${verdictClass(j.verdict)}">${j.verdict}</span>`}
         </div>`)}
 
-      ${jobs.length > 0 && html`
-        <button class="btn btn-secondary btn-full"
-          style="font-size:10px;padding:5px;margin-top:8px"
-          onClick=${() => chrome.tabs.create({ url: `${base}/discovery` })}>
-          Open full ranked list
-        </button>`}
+      <button class="btn btn-secondary btn-full"
+        style="font-size:10px;padding:5px;margin-top:8px"
+        onClick=${() => chrome.tabs.create({ url: `${base}/discovery` })}>
+        ${jobs.length > 0 ? 'Open full ranked list' : 'Open discovery page'}
+      </button>
     </div>`;
 }
 

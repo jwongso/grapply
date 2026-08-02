@@ -25,7 +25,7 @@ import logging
 import re
 import sys
 import textwrap
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -1768,17 +1768,17 @@ if __name__ == "__main__":
 # ══════════════════════════════════════════════════════════════════════════════
 
 _DISCOVERY_STATE: dict = {"running": False, "stage": "idle", "done": 0,
-                          "total": 0, "error": ""}
+                          "total": 0, "error": "", "finished": ""}
 
 
-def _discovery_worker(prefilter_min: float, limit: int,
+def _discovery_worker(prefilter_min: float | None, limit: int | None,
                       do_llm: bool, do_rank: bool, include_seen: bool) -> None:
     import discovery
     def progress(stage: str, done: int, total: int) -> None:
         _DISCOVERY_STATE.update(stage=stage, done=done, total=total)
     try:
         _DISCOVERY_STATE.update(running=True, stage="starting", done=0,
-                                total=0, error="")
+                                total=0, error="", finished="")
         discovery.run_scan(prefilter_min=prefilter_min, limit=limit,
                            do_llm=do_llm, do_rank=do_rank,
                            include_seen=include_seen, progress=progress)
@@ -1786,7 +1786,9 @@ def _discovery_worker(prefilter_min: float, limit: int,
         logger.exception("[discovery] scan failed")
         _DISCOVERY_STATE.update(error=str(exc), stage="error")
     finally:
-        _DISCOVERY_STATE.update(running=False)
+        _DISCOVERY_STATE.update(
+            running=False,
+            finished=datetime.now(timezone.utc).isoformat(timespec="seconds"))
 
 
 @app.get("/discovery", response_class=HTMLResponse)
@@ -1813,13 +1815,58 @@ def discovery_sources_endpoint():
             "path": str(discovery.SOURCES_PATH)}
 
 
+@app.get("/discovery/config")
+def discovery_config_endpoint():
+    """Search phases and thresholds, so they can be edited from the UI rather
+    than by hand-editing JSON."""
+    import discovery
+    cfg = discovery.load_config()
+    try:
+        import render
+        engines = render.usable_engines()
+        browser = render.available()
+        profiles = sorted(render.SITE_PROFILES)
+    except Exception:                                           # noqa: BLE001
+        engines, browser, profiles = [], False, []
+    return {"config": cfg, "path": str(discovery.CONFIG_PATH),
+            "browser": {"available": browser, "engines": engines,
+                        "profiles": profiles}}
+
+
+@app.post("/discovery/config")
+def discovery_config_save_endpoint(payload: dict,
+                                   _: None = Depends(_require_token)):
+    import discovery
+    cfg = payload.get("config", payload)
+    if not isinstance(cfg, dict) or not cfg.get("phases"):
+        raise HTTPException(status_code=400, detail="config needs 'phases'")
+    discovery.save_config(cfg)
+    return {"saved": True, "path": str(discovery.CONFIG_PATH)}
+
+
+@app.post("/discovery/dismiss")
+def discovery_dismiss_endpoint(payload: dict,
+                               _: None = Depends(_require_token)):
+    """Hide a posting for good. This is the only thing that removes a role from
+    future scans - being seen no longer does."""
+    import discovery
+    job_id = (payload or {}).get("id", "")
+    if not job_id:
+        raise HTTPException(status_code=400, detail="id required")
+    if (payload or {}).get("applied"):
+        discovery.mark_applied(job_id)
+    else:
+        discovery.dismiss(job_id)
+    return {"ok": True, "id": job_id}
+
+
 @app.post("/discovery/run")
 def discovery_run_endpoint(
-    prefilter_min: float = 55.0,
-    limit: int = 25,
+    prefilter_min: float | None = None,
+    limit: int | None = None,
     llm: bool = True,
     rank: bool = True,
-    include_seen: bool = False,
+    include_seen: bool = True,
     _: None = Depends(_require_token),
 ):
     if _DISCOVERY_STATE["running"]:

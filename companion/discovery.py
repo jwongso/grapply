@@ -1,25 +1,30 @@
 """
-grapply — job discovery
+grapply - job discovery
 
-The missing half of grapply: instead of you finding a posting and grabbing it,
-this goes and finds postings worth grabbing.
+Finds postings worth applying to, instead of waiting for you to find them.
 
-Design: poll the *ATS APIs* of a curated company registry, not aggregator sites.
-Greenhouse, Lever, Ashby and SmartRecruiters all expose public unauthenticated
-JSON with full job descriptions. No scraping, no Cloudflare, no captcha, and the
-data is structured rather than guessed at.
+Search runs in phases, in priority order. The default is the shape most job
+hunts actually have: everything local first, then remote-worldwide as the
+fallback. Each phase decides its own sources and its own location gate, so
+"remote" means remote in the phase that wants it and is irrelevant in the one
+that does not.
 
-Two-stage scoring, because LLM-scoring every posting is wasteful - Rocket Lab
-alone publishes ~370 roles:
+  phase 1  New Zealand   Seek NZ + the company registry
+  phase 2  Remote        remote aggregators + the registry
 
-  stage 1  cheap local keyword prefilter (no LLM, milliseconds)
-  stage 2  analyzer.score_job_fit() on survivors only (real LLM fit score 0-10)
+Scoring stays two-stage, because running an LLM over every posting is wasteful
+when Seek alone returns hundreds:
 
-Seen postings are remembered, so repeat runs only surface what is new.
+  stage 1  keyword prefilter, local, milliseconds, fully explainable
+  stage 2  LLM fit score, then a comparative ranking pass, survivors only
 
-  python -m companion.discovery --validate          # check the registry
-  python -m companion.discovery --prefilter-only    # no LLM, fast triage
-  python -m companion.discovery --min-score 7.5     # full run
+Seen postings are remembered but NOT hidden. Hiding them was why a rescan kept
+showing an empty or week-old list: everything had been seen once, so nothing
+survived. A posting now disappears only when you dismiss or apply to it.
+
+  python -m companion.discovery --validate       # check the registry
+  python -m companion.discovery --prefilter-only # no LLM, fast triage
+  python -m companion.discovery --rank           # full run
 """
 
 from __future__ import annotations
@@ -28,56 +33,59 @@ import argparse
 import json
 import re
 import sys
-import time
-import urllib.error
-import urllib.request
-from datetime import datetime, timezone
-from html import unescape
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
+
+try:
+    from . import sources as src_mod
+except ImportError:                                              # direct run
+    import sources as src_mod                                    # type: ignore
 
 STATE_PATH   = Path("~/.grapply/discovery_state.json").expanduser()
 LAST_PATH    = Path("~/.grapply/discovery_last.json").expanduser()
 SOURCES_PATH = Path("~/.grapply/sources.json").expanduser()
-UA = "Mozilla/5.0 (X11; Linux x86_64) grapply-discovery/1.0"
+CONFIG_PATH  = Path("~/.grapply/discovery_config.json").expanduser()
 
-# ── candidate profile: hard gates and weighted signals ───────────────────────
-# Tune these. Every result reports which terms matched, so the threshold can be
-# calibrated from real runs instead of guessed.
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Candidate profile - hard gates and weighted signals
+# ══════════════════════════════════════════════════════════════════════════════
+# Every result reports which terms matched, so thresholds can be calibrated
+# against real runs instead of guessed.
 
 TITLE_REJECT = (
     "intern", "internship", "graduate", "new grad", "junior", "trainee",
     "apprentice", "student", "placement", "co-op", "co op",
 )
 
-REQUIRE_ANY = ("c++", "cpp", "c/c++")
+# The NZ market is far too small to gate on C++ alone - that rejected roughly
+# 97% of everything fetched. C#/.NET (Framecad, AWS-backed services) and Python
+# (SAP tooling, current work) are both real, shipped experience, so a posting
+# qualifies on any of the three. Priority order is reflected in the weights
+# below, not by excluding the other two here.
+REQUIRE_ANY = ("c++", "cpp", "c/c++", "c#", "csharp", ".net", "dotnet",
+               "python")
 
-# The JD body mentioning C++ is not enough - quant firms mention it in trader and
-# analyst postings too. The TITLE has to describe an engineering role.
+# A JD body mentioning C++ is not enough - quant firms name it in trader and
+# analyst postings too. The title has to describe an engineering role.
 TITLE_REQUIRE_ANY = (
     "engineer", "developer", "programmer", "software", "architect",
     "sre", "devops", "lead", "leader",
 )
 
-# Some postings carry a senior-sounding title but say "Junior ..." in the first
-# line. Eqvilent's "Software Developer (Algorithmic Engineering)" opens with
-# "We are seeking a Junior Quantitative Developer". Check the opening text too.
+# Some postings carry a senior-sounding title but open with "Junior ...".
 BODY_LEVEL_REJECT = (
     "seeking a junior", "looking for a junior", "hiring a junior",
     "junior quantitative", "junior software", "junior developer",
     "junior engineer", "graduate programme", "graduate program",
     "entry-level", "entry level position",
 )
+
 TITLE_REJECT_ROLE = (
     "trader", "analyst", "researcher", "recruiter", "sales", "account",
     "marketing", "counsel", "accountant", "buyer", "planner", "technician",
     "quantitative trader", "hr ",
-)
-
-LOCATION_OK = (
-    "remote", "anywhere", "worldwide", "global", "distributed", "emea",
-    "new zealand", "auckland", "wellington", "christchurch",
-    "australia", "sydney", "melbourne", "brisbane", "perth", "apac",
 )
 
 HARD_BLOCK = (
@@ -86,10 +94,9 @@ HARD_BLOCK = (
     "citizens only", "itar", "polygraph",
 )
 
-# US aerospace and defence firms paste ITAR / US-citizenship boilerplate into
-# EVERY posting, including roles based in Auckland and staffed by locals. So the
-# hard block only bites when the role is actually US-located; elsewhere it is
-# downgraded to a note for you to verify.
+# US aerospace and defence firms paste ITAR boilerplate into every posting,
+# including Auckland roles staffed by locals. The block only bites when the role
+# is genuinely US-located; elsewhere it becomes a note to verify.
 NON_US_LOCATION = (
     "new zealand", "auckland", "wellington", "christchurch", "nz",
     "australia", "sydney", "melbourne", "brisbane", "perth",
@@ -97,10 +104,28 @@ NON_US_LOCATION = (
     "united kingdom", "singapore", "hong kong", "japan", "canada", "india",
 )
 
+NZ_TERMS = ("new zealand", "auckland", "wellington", "christchurch",
+            "hamilton", "tauranga", "dunedin", "palmerston", "napier", "nz")
+
+REMOTE_TERMS = ("remote", "anywhere", "worldwide", "global", "distributed",
+                "work from home", "wfh", "fully remote", "remote-first")
+
 WEIGHTS: dict[str, tuple[int, tuple[str, ...]]] = {
+    # Language buckets are weighted by preference, not by capability: C++ is
+    # the deepest and best-evidenced, C#/.NET is real production experience,
+    # Python is genuine but more supporting-cast. A role scores on whichever it
+    # asks for, and a C++ role still outranks an equivalent Python one.
     "core_cpp": (24, (
         "c++", "c++11", "c++14", "c++17", "c++20", "c++23", "modern c++",
         "stl", "template", "raii", "object-oriented", "object oriented",
+    )),
+    "core_dotnet": (18, (
+        "c#", "csharp", ".net", "dotnet", ".net core", "asp.net", "wpf",
+        "entity framework", "nuget", "xamarin", "blazor",
+    )),
+    "core_python": (14, (
+        "python", "python3", "django", "flask", "fastapi", "numpy", "pandas",
+        "pytest", "asyncio",
     )),
     "systems": (24, (
         "embedded linux", "embedded", "device driver", "driver development",
@@ -108,7 +133,7 @@ WEIGHTS: dict[str, tuple[int, tuple[str, ...]]] = {
         "multithread", "multi-threaded", "concurrency", "lock-free",
         "memory model", "performance", "optimisation", "optimization",
         "profiling", "latency", "throughput", "linux internals", "posix",
-        "cross-compil", "buildroot", "sanitizer", "valgrind",
+        "cross-compil*", "buildroot", "sanitizer", "valgrind",
     )),
     "domain": (20, (
         "automotive", "radar", "lidar", "sensor fusion", "perception",
@@ -133,8 +158,8 @@ WEIGHTS: dict[str, tuple[int, tuple[str, ...]]] = {
     )),
 }
 
-# He genuinely lacks these. A keyword match that dies in the first technical
-# call is worse than no match at all.
+# Genuine gaps. A keyword match that dies in the first technical call is worse
+# than no match at all.
 PENALTIES: dict[str, int] = {
     "unreal engine": 12, "unity": 10, "game engine": 10, "gameplay": 8,
     "animation": 5, "shader": 4,
@@ -144,220 +169,87 @@ PENALTIES: dict[str, int] = {
     "php": 6, "ruby": 6, "salesforce": 10, "sap abap": 0,
 }
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Configuration
+# ══════════════════════════════════════════════════════════════════════════════
+
 DEFAULT_SOURCES: list[dict[str, str]] = [
-    # verified working 30 Jul 2026
     {"ats": "greenhouse", "slug": "rocketlab",     "name": "Rocket Lab"},
     {"ats": "greenhouse", "slug": "eqvilentjobs",  "name": "Eqvilent"},
     {"ats": "greenhouse", "slug": "imc",           "name": "IMC Trading"},
     {"ats": "greenhouse", "slug": "janestreet",    "name": "Jane Street"},
     {"ats": "greenhouse", "slug": "dawnaerospace", "name": "Dawn Aerospace"},
-    # add more - run --validate after editing ~/.grapply/sources.json
 ]
 
-
-# ── http ─────────────────────────────────────────────────────────────────────
-
-def _get_json(url: str, timeout: float = 20.0) -> Any | None:
-    req = urllib.request.Request(url, headers={"User-Agent": UA,
-                                               "Accept": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode("utf-8", "replace"))
-    except (urllib.error.URLError, urllib.error.HTTPError, ValueError,
-            TimeoutError, OSError):
-        return None
-
-
-# Some boards post titles with Cyrillic homoglyphs ("С++" with Cyrillic Es),
-# which silently breaks keyword matching. Fold them to ASCII first.
-_HOMOGLYPHS = str.maketrans({
-    "\u0410": "A", "\u0412": "B", "\u0421": "C", "\u0415": "E", "\u041d": "H",
-    "\u041a": "K", "\u041c": "M", "\u041e": "O", "\u0420": "P", "\u0422": "T",
-    "\u0425": "X", "\u0430": "a", "\u0435": "e", "\u043e": "o", "\u0440": "p",
-    "\u0441": "c", "\u0445": "x", "\u0443": "y",
-})
-
-
-def _fold(text: str) -> str:
-    return (text or "").translate(_HOMOGLYPHS)
-
-
-def _strip_html(raw: str) -> str:
-    if not raw:
-        return ""
-    txt = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", raw,
-                 flags=re.S | re.I)
-    txt = re.sub(r"<br\s*/?>|</p>|</li>", "\n", txt, flags=re.I)
-    txt = re.sub(r"<[^>]+>", " ", txt)
-    return re.sub(r"[ \t]{2,}", " ", unescape(txt)).strip()
-
-
-# ── ATS adapters: each yields normalised dicts ───────────────────────────────
-
-def _from_greenhouse(slug: str, name: str) -> list[dict]:
-    data = _get_json(
-        f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true")
-    if not isinstance(data, dict):
-        return []
-    out = []
-    for j in data.get("jobs", []):
-        out.append({
-            "id":      f"gh:{slug}:{j.get('id')}",
-            "company": name,
-            "title":   (j.get("title") or "").strip(),
-            "location": (j.get("location") or {}).get("name", ""),
-            "url":     j.get("absolute_url", ""),
-            "posted":  j.get("updated_at", "") or j.get("first_published", ""),
-            "description": _strip_html(j.get("content", "")),
-        })
-    return out
-
-
-def _from_lever(slug: str, name: str) -> list[dict]:
-    data = _get_json(f"https://api.lever.co/v0/postings/{slug}?mode=json")
-    if not isinstance(data, list):
-        return []
-    out = []
-    for j in data:
-        cats = j.get("categories", {}) or {}
-        out.append({
-            "id":      f"lever:{slug}:{j.get('id')}",
-            "company": name,
-            "title":   (j.get("text") or "").strip(),
-            "location": cats.get("location", "") or "",
-            "url":     j.get("hostedUrl", ""),
-            "posted":  str(j.get("createdAt", "")),
-            "description": _strip_html(
-                j.get("descriptionPlain") or j.get("description", "")),
-        })
-    return out
-
-
-def _from_ashby(slug: str, name: str) -> list[dict]:
-    data = _get_json(
-        f"https://api.ashbyhq.com/posting-api/job-board/{slug}?includeCompensation=true")
-    if not isinstance(data, dict):
-        return []
-    out = []
-    for j in data.get("jobs", []):
-        out.append({
-            "id":      f"ashby:{slug}:{j.get('id')}",
-            "company": name,
-            "title":   (j.get("title") or "").strip(),
-            "location": j.get("location", "") or "",
-            "url":     j.get("jobUrl", ""),
-            "posted":  j.get("publishedAt", ""),
-            "description": _strip_html(
-                j.get("descriptionHtml") or j.get("descriptionPlain", "")),
-        })
-    return out
-
-
-def _from_smartrecruiters(slug: str, name: str) -> list[dict]:
-    data = _get_json(
-        f"https://api.smartrecruiters.com/v1/companies/{slug}/postings?limit=100")
-    if not isinstance(data, dict):
-        return []
-    out = []
-    for j in data.get("content", []):
-        loc = j.get("location", {}) or {}
-        out.append({
-            "id":      f"sr:{slug}:{j.get('id')}",
-            "company": name,
-            "title":   (j.get("name") or "").strip(),
-            "location": ", ".join(
-                x for x in (loc.get("city"), loc.get("country")) if x),
-            "url":     f"https://jobs.smartrecruiters.com/{slug}/{j.get('id')}",
-            "posted":  j.get("releasedDate", ""),
-            "description": "",   # SmartRecruiters needs a second call per job
-        })
-    return out
-
-
-ADAPTERS = {
-    "greenhouse":      _from_greenhouse,
-    "lever":           _from_lever,
-    "ashby":           _from_ashby,
-    "smartrecruiters": _from_smartrecruiters,
+# Seek is queried per keyword, so keep the list short and high-signal - each
+# term is a full paginated search.
+DEFAULT_CONFIG: dict[str, Any] = {
+    "phases": [
+        {
+            "name": "New Zealand",
+            "enabled": True,
+            "gate": "nz",
+            # Searching "c++" alone is too narrow: boards tokenise the plus
+            # signs unpredictably and plenty of matching roles never put it in
+            # the title. Cast wide on job titles and let the prefilter enforce
+            # the C++ requirement against the full JD - recall goes up, and
+            # precision is unchanged because the gate is downstream.
+            "keywords": ["senior software engineer", "senior software developer",
+                         "c++", "c# .net", "python developer",
+                         "embedded software", "firmware"],
+            "seek_sites": ["nz"],
+            "aggregators": [],
+            # Indeed needs a headed, signed-in browser (page 2+ is gated behind
+            # login), which the render layer handles. Seek is deliberately not
+            # here: it server-renders and its JSON API returns more, faster.
+            "browser_profiles": ["indeed-nz"],
+            "browser_pages": 6,
+            "use_registry": True,
+            "max_jobs": 400,
+        },
+        {
+            "name": "Remote worldwide",
+            "enabled": True,
+            "gate": "remote",
+            "keywords": ["c++", "senior software engineer"],
+            "seek_sites": [],
+            "aggregators": ["arbeitnow", "remoteok", "remotive", "jobicy",
+                            "workingnomads", "himalayas"],
+            "browser_profiles": [],
+            "use_registry": True,
+            "max_jobs": 400,
+        },
+    ],
+    "prefilter_min": 45.0,
+    "llm_limit": 25,
+    # Seek detail calls per phase. This is a total now that stubs are
+    # de-duplicated across keywords, not a per-keyword budget - set it below
+    # the unique candidate count and you silently throw away good matches.
+    "hydrate_limit": 320,
+    "browser_engine": "rotate",
+    "browser_device": "desktop",
+    "headless": True,
 }
 
 
-# ── stage 1: cheap local prefilter ───────────────────────────────────────────
-
-def prefilter(job: dict) -> dict:
-    """Score 0-100 on keywords alone. No LLM. Explainable."""
-    title = _fold(job["title"]).lower()
-    loc   = _fold(job.get("location") or "").lower()
-    body  = _fold(job.get("description", "")).lower()
-    blob  = f"{title}\n{loc}\n{body}"
-
-    reject: list[str] = []
-    notes: list[str] = []
-    non_us = any(t in loc for t in NON_US_LOCATION)
-    if any(t in title for t in TITLE_REJECT):
-        reject.append("title looks junior/intern")
-    if not any(t in title for t in TITLE_REQUIRE_ANY):
-        reject.append(f"title is not an engineering role: {job['title']}")
-    if any(t in title for t in TITLE_REJECT_ROLE):
-        reject.append(f"non-engineering role type: {job['title']}")
-    opening = body[:1200]
-    for t in BODY_LEVEL_REJECT:
-        if t in opening:
-            reject.append(f"body advertises a junior/entry role ('{t}')")
-            break
-    if not any(t in blob for t in REQUIRE_ANY):
-        reject.append("no C/C++ signal")
-    if not any(t in loc for t in LOCATION_OK) and "remote" not in blob:
-        reject.append(f"location unreachable: {job.get('location') or '?'}")
-    for t in HARD_BLOCK:
-        if t in blob:
-            if non_us:
-                notes.append(
-                    f"'{t}' appears in the text, but the role is located in "
-                    f"{job.get('location')} - likely US template boilerplate. Verify.")
-            else:
-                reject.append(f"hard block: {t}")
-            break
-
-    hits: dict[str, list[str]] = {}
-    score = 0.0
-    for bucket, (weight, terms) in WEIGHTS.items():
-        matched = [t for t in terms if t in (title if bucket == "seniority" else blob)]
-        if matched:
-            hits[bucket] = matched
-            # saturating: 1 hit gets 55% of the weight, 4+ gets all of it
-            frac = min(1.0, 0.55 + 0.15 * (len(matched) - 1))
-            score += weight * frac
-
-    pen: list[str] = []
-    for term, cost in PENALTIES.items():
-        if cost and term in blob:
-            score -= cost
-            pen.append(f"{term} (-{cost})")
-
-    return {
-        "prefilter_score": round(max(0.0, min(100.0, score)), 1),
-        "hits": hits,
-        "penalties": pen,
-        "notes": notes,
-        "reject": reject,
-    }
-
-
-# ── state ────────────────────────────────────────────────────────────────────
-
-def _load_state() -> dict:
-    if STATE_PATH.exists():
+def load_config() -> dict:
+    if CONFIG_PATH.exists():
         try:
-            return json.loads(STATE_PATH.read_text())
+            cfg = json.loads(CONFIG_PATH.read_text())
+            if isinstance(cfg, dict) and cfg.get("phases"):
+                merged = dict(DEFAULT_CONFIG)
+                merged.update(cfg)
+                return merged
         except ValueError:
             pass
-    return {"seen": {}}
+    save_config(DEFAULT_CONFIG)
+    return dict(DEFAULT_CONFIG)
 
 
-def _save_state(state: dict) -> None:
-    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    STATE_PATH.write_text(json.dumps(state, indent=2))
+def save_config(cfg: dict) -> None:
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
 
 
 def load_sources() -> list[dict[str, str]]:
@@ -373,33 +265,354 @@ def load_sources() -> list[dict[str, str]]:
     return DEFAULT_SOURCES
 
 
-# ── fetch ────────────────────────────────────────────────────────────────────
+def save_sources(rows: list[dict]) -> None:
+    SOURCES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SOURCES_PATH.write_text(json.dumps(rows, indent=2))
 
-def fetch_all(sources: Iterable[dict], verbose: bool = True) -> list[dict]:
-    jobs: list[dict] = []
-    for src in sources:
-        fn = ADAPTERS.get(src.get("ats", ""))
-        if not fn:
-            if verbose:
-                print(f"  ?  unknown ats: {src}", file=sys.stderr)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# State - remember, but do not hide
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _load_state() -> dict:
+    if STATE_PATH.exists():
+        try:
+            st = json.loads(STATE_PATH.read_text())
+            if isinstance(st, dict):
+                st.setdefault("seen", {})
+                st.setdefault("dismissed", {})
+                st.setdefault("applied", {})
+                return st
+        except ValueError:
+            pass
+    return {"seen": {}, "dismissed": {}, "applied": {}}
+
+
+def _save_state(state: dict) -> None:
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STATE_PATH.write_text(json.dumps(state, indent=2))
+
+
+def dismiss(job_id: str) -> None:
+    st = _load_state()
+    st["dismissed"][job_id] = datetime.now(timezone.utc).isoformat()
+    _save_state(st)
+
+
+def mark_applied(job_id: str) -> None:
+    st = _load_state()
+    st["applied"][job_id] = datetime.now(timezone.utc).isoformat()
+    _save_state(st)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Stage 1 - local prefilter
+# ══════════════════════════════════════════════════════════════════════════════
+
+_TERM_RX: dict[str, re.Pattern] = {}
+
+
+def _has(blob: str, term: str) -> bool:
+    """Whole-term match, not substring.
+
+    Plain `in` is badly wrong here: "unity" fires on "opportunity", "git" on
+    "legitimate", "rust" on "trust". Every posting picked up a spurious -10 for
+    a game engine it never mentioned. Terms are matched on non-alphanumeric
+    boundaries instead, so "c++" and "ci/cd" still work. A trailing "*" marks a
+    deliberate prefix, e.g. "cross-compil*" matching "cross-compilation".
+    """
+    rx = _TERM_RX.get(term)
+    if rx is None:
+        prefix = term.endswith("*")
+        raw = term[:-1] if prefix else term
+        core = re.escape(raw)
+        # A boundary only makes sense against an alphanumeric edge. "c++" ends
+        # in '+', so demanding a non-alphanumeric after it would reject
+        # "c++17" - which is exactly how most postings write it.
+        head = r"(?<![a-z0-9])" if raw[:1].isalnum() else ""
+        tail = r"(?![a-z0-9])" if (raw[-1:].isalnum() and not prefix) else ""
+        rx = re.compile(rf"{head}{core}{tail}")
+        _TERM_RX[term] = rx
+    return rx.search(blob) is not None
+
+
+def _any(blob: str, terms: Iterable[str]) -> bool:
+    return any(_has(blob, t) for t in terms)
+
+
+def _location_ok(job: dict, gate: str) -> tuple[bool, str]:
+    """Phase-aware location gate. Returns (ok, reason_if_not)."""
+    loc = src_mod.fold(job.get("location") or "").lower()
+    body = src_mod.fold(job.get("description") or "").lower()[:3000]
+    is_remote = bool(job.get("remote")) or _any(loc, REMOTE_TERMS)
+
+    if gate == "nz":
+        if _any(loc, NZ_TERMS):
+            return True, ""
+        # A worldwide-remote role is reachable from NZ, so it belongs here too.
+        if is_remote and _any(f"{loc} {body}",
+                              ("worldwide", "anywhere", "global",
+                               "new zealand")):
+            return True, ""
+        return False, f"not NZ-reachable: {job.get('location') or '?'}"
+
+    if gate == "remote":
+        if is_remote or _any(body[:1500], REMOTE_TERMS):
+            return True, ""
+        return False, f"not remote: {job.get('location') or '?'}"
+
+    return True, ""
+
+
+def prefilter(job: dict, gate: str = "") -> dict:
+    """Score 0-100 on keywords alone. No LLM, fully explainable."""
+    title = src_mod.fold(job["title"]).lower()
+    loc   = src_mod.fold(job.get("location") or "").lower()
+    body  = src_mod.fold(job.get("description", "")).lower()
+    blob  = f"{title}\n{loc}\n{body}"
+
+    reject: list[str] = []
+    notes: list[str] = []
+    non_us = any(t in loc for t in NON_US_LOCATION)
+
+    if _any(title, TITLE_REJECT):
+        reject.append("title looks junior/intern")
+    if not _any(title, TITLE_REQUIRE_ANY):
+        reject.append(f"title is not an engineering role: {job['title']}")
+    if _any(title, TITLE_REJECT_ROLE):
+        reject.append(f"non-engineering role type: {job['title']}")
+
+    opening = body[:1200]
+    for t in BODY_LEVEL_REJECT:
+        if _has(opening, t):
+            reject.append(f"body advertises a junior/entry role ('{t}')")
+            break
+
+    if not _any(blob, REQUIRE_ANY):
+        reject.append("no C/C++ signal")
+
+    if gate:
+        ok, why = _location_ok(job, gate)
+        if not ok:
+            reject.append(why)
+
+    for t in HARD_BLOCK:
+        if _has(blob, t):
+            if non_us:
+                notes.append(
+                    f"'{t}' appears in the text, but the role is located in "
+                    f"{job.get('location')} - likely US template boilerplate. "
+                    "Verify.")
+            else:
+                reject.append(f"hard block: {t}")
+            break
+
+    hits: dict[str, list[str]] = {}
+    score = 0.0
+    for bucket, (weight, terms) in WEIGHTS.items():
+        target = title if bucket == "seniority" else blob
+        matched = [t.rstrip("*") for t in terms if _has(target, t)]
+        if matched:
+            hits[bucket] = matched
+            # Saturating: 1 hit earns 55% of the weight, 4+ earns all of it.
+            frac = min(1.0, 0.55 + 0.15 * (len(matched) - 1))
+            score += weight * frac
+
+    pen: list[str] = []
+    for term, cost in PENALTIES.items():
+        if cost and _has(blob, term):
+            score -= cost
+            pen.append(f"{term} (-{cost})")
+
+    return {
+        "prefilter_score": round(max(0.0, min(100.0, score)), 1),
+        "hits": hits, "penalties": pen, "notes": notes, "reject": reject,
+    }
+
+
+def triage_title(job: dict) -> bool:
+    """Cheap gate for deciding whether a posting is worth a detail fetch.
+
+    Seek search returns a teaser, and hydrating every hit would be hundreds of
+    calls. Judge on title and teaser first: reject what is obviously wrong, keep
+    anything plausible - the real prefilter runs afterwards on the full JD.
+    """
+    title = src_mod.fold(job.get("title", "")).lower()
+    if _any(title, TITLE_REJECT):
+        return False
+    if _any(title, TITLE_REJECT_ROLE):
+        return False
+    if not _any(title, TITLE_REQUIRE_ANY):
+        return False
+    return True
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Dedupe - the same role often appears on Seek and on the company's own board
+# ══════════════════════════════════════════════════════════════════════════════
+
+_NOISE = re.compile(r"[^a-z0-9+ ]+")
+
+
+def _dedupe_key(job: dict) -> tuple[str, str]:
+    title = _NOISE.sub(" ", src_mod.fold(job.get("title", "")).lower())
+    title = re.sub(r"\b(senior|snr|sr|junior|jnr|lead|principal|staff)\b",
+                   " ", title)
+    company = _NOISE.sub(" ", src_mod.fold(job.get("company", "")).lower())
+    return (" ".join(title.split()), " ".join(company.split()))
+
+
+def dedupe(jobs: list[dict]) -> list[dict]:
+    """Keep the richest copy of each role: the one with the longest JD, since
+    that is what the prefilter and the LLM both read."""
+    best: dict[tuple[str, str], dict] = {}
+    for j in jobs:
+        k = _dedupe_key(j)
+        if not k[0]:
             continue
-        got = fn(src["slug"], src.get("name", src["slug"]))
-        if verbose:
-            mark = "ok" if got else "--"
-            print(f"  {mark} {src['ats']:<16} {src.get('name', src['slug']):<22} {len(got):>4}")
+        cur = best.get(k)
+        if cur is None or len(j.get("description", "")) > len(
+                cur.get("description", "")):
+            if cur is not None:
+                j.setdefault("also_on", []).extend(
+                    [cur.get("source", "")] + cur.get("also_on", []))
+            best[k] = j
+        else:
+            cur.setdefault("also_on", []).append(j.get("source", ""))
+    for j in best.values():
+        if j.get("also_on"):
+            # Only worth showing when the duplicate came from a different
+            # source - "also on seek-nz" for a Seek posting is just noise.
+            others = {s for s in j["also_on"] if s and s != j.get("source")}
+            if others:
+                j["also_on"] = sorted(others)
+            else:
+                j.pop("also_on", None)
+    return list(best.values())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Gathering
+# ══════════════════════════════════════════════════════════════════════════════
+
+def gather_phase(phase: dict, cfg: dict, registry: list[dict],
+                 log: Callable[[str], None],
+                 registry_jobs: list[dict] | None = None) -> list[dict]:
+    """Fetch every source a phase asks for. Never raises for one bad source.
+
+    registry_jobs lets the caller poll the company registry once and share it
+    across phases - the ATS results are identical either way, and every phase
+    re-polling them is pure duplicate traffic.
+    """
+    jobs: list[dict] = []
+    gate = phase.get("gate", "")
+
+    if phase.get("use_registry", True) and registry:
+        if registry_jobs is None:
+            registry_jobs = src_mod.fetch_registry(
+                registry, on_source=lambda n, c: log(f"    registry {n}: {c}"))
+        got = [dict(j) for j in registry_jobs]
+        log(f"  registry: {len(got)}")
         jobs.extend(got)
-        time.sleep(0.3)
+
+    for site in phase.get("seek_sites", []):
+        # Collect every keyword's hits first and de-duplicate by posting id
+        # before hydrating. Keywords overlap heavily - a senior C++ embedded
+        # role matches four of them - and hydration is one HTTP call per
+        # posting, so deduplicating first is the difference between ~450 calls
+        # and ~150 for the same result.
+        per_kw: list[list[dict]] = []
+        seen_ids: set[str] = set()
+        for kw in phase.get("keywords", []):
+            try:
+                stubs = src_mod.seek_search(
+                    kw, site=site, max_jobs=phase.get("max_jobs", 300))
+            except Exception as exc:                             # noqa: BLE001
+                log(f"  seek-{site} '{kw}': failed ({exc})")
+                continue
+            keep = [j for j in stubs if triage_title(j)]
+            fresh = [j for j in keep if j["id"] not in seen_ids]
+            seen_ids.update(j["id"] for j in fresh)
+            log(f"  seek-{site} '{kw}': {len(stubs)} found, "
+                f"{len(keep)} past triage, {len(fresh)} new")
+            per_kw.append(fresh)
+
+        # Interleave rather than concatenate. Seek returns by relevance, so
+        # every keyword's best hits should get budget - concatenating lets the
+        # broadest keyword consume it all before the specific ones are reached.
+        pool: list[dict] = []
+        for i in range(max((len(k) for k in per_kw), default=0)):
+            for lst in per_kw:
+                if i < len(lst):
+                    pool.append(lst[i])
+
+        todo = pool[: cfg.get("hydrate_limit", 320)]
+        if todo:
+            log(f"  seek-{site}: hydrating {len(todo)} unique postings")
+            todo = src_mod.seek_hydrate(todo, site=site)
+        jobs.extend(todo)
+
+    aggs = phase.get("aggregators", [])
+    if aggs:
+        got = src_mod.fetch_aggregators(
+            aggs, on_source=lambda n, c: log(f"    {n}: {c}"))
+        log(f"  aggregators: {len(got)}")
+        jobs.extend(got)
+
+    profiles = phase.get("browser_profiles", [])
+    if profiles:
+        try:
+            from . import render                                 # noqa: PLC0415
+        except ImportError:
+            try:
+                import render                                    # type: ignore
+            except ImportError:
+                render = None                                    # type: ignore
+        if render is None or not render.available():
+            log("  browser profiles skipped (playwright not installed)")
+        else:
+            before = len(jobs)
+            # Browser sources are minutes per keyword, and boards run their own
+            # relevance ranking, so a second near-synonym mostly re-returns the
+            # first one's results. One keyword by default; raise it only if a
+            # site genuinely partitions its index by query.
+            for kw in phase.get("keywords", [])[:phase.get("browser_keywords", 1)]:
+                try:
+                    got = render.fetch_profiles(
+                        profiles, kw, max_jobs=phase.get("max_jobs", 100),
+                        max_pages=phase.get("browser_pages", 4),
+                        headless=cfg.get("headless", True),
+                        engine=cfg.get("browser_engine", "rotate"),
+                        device=cfg.get("browser_device", "desktop"))
+                except Exception as exc:                         # noqa: BLE001
+                    log(f"  browser '{kw}': failed ({exc})")
+                    continue
+                log(f"  browser '{kw}': {len(got)}")
+                jobs.extend(got)
+            if len(jobs) == before:
+                log("  browser returned nothing - JSON sources still apply")
+
+    for j in jobs:
+        j.setdefault("phase", phase.get("name", gate))
     return jobs
 
 
-# ── stage 2: LLM fit score, survivors only ───────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Stage 2 - LLM scoring and comparative ranking
+# ══════════════════════════════════════════════════════════════════════════════
 
-def llm_score(jobs: list[dict], verbose: bool = True) -> list[dict]:
+def _ai_bits():
     try:
         from . import ai_client as ai_module, analyzer, config
-    except ImportError:
-        import ai_client as ai_module, analyzer, config  # type: ignore
+    except ImportError:                                          # direct run
+        import ai_client as ai_module, analyzer, config          # type: ignore
+    return ai_module, analyzer, config
 
+
+def llm_score(jobs: list[dict], verbose: bool = True,
+              progress: Callable[[int, int], None] | None = None,
+              ) -> list[dict]:
+    ai_module, analyzer, config = _ai_bits()
     cfg    = config.load()
     resume = config.load_resume_text(cfg)
     if not resume.strip():
@@ -412,16 +625,16 @@ def llm_score(jobs: list[dict], verbose: bool = True) -> list[dict]:
         if verbose:
             print(f"  [{i}/{len(jobs)}] {job['company']} - {job['title'][:52]}",
                   file=sys.stderr)
+        if progress:
+            progress(i, len(jobs))
         try:
             res = analyzer.score_job_fit(job.get("description", ""), resume, ai)
-        except Exception as exc:                      # noqa: BLE001
+        except Exception as exc:                                 # noqa: BLE001
             res = {"error": str(exc), "score": 0}
         job["llm"] = res
         job["llm_score"] = float(res.get("score", 0) or 0)
     return jobs
 
-
-# ── comparative ranking ──────────────────────────────────────────────────────
 
 RANK_SYSTEM = (
     "You are a blunt technical recruiter ranking roles for ONE candidate. "
@@ -437,39 +650,37 @@ RANK_SYSTEM = (
 
 
 def rank_candidates(jobs: list[dict], verbose: bool = True) -> list[dict]:
-    """Second LLM pass: rank the shortlist against each other, not in isolation.
+    """Rank the shortlist against each other rather than in isolation.
 
-    Scoring each posting alone compresses everything into 8-9. Ranking them
-    comparatively forces real separation, which is what a human needs to decide
-    where to spend a limited number of applications.
+    Scoring postings alone compresses everything into 8-9. Ranking comparatively
+    forces real separation, which is what you need to decide where to spend a
+    limited number of applications.
     """
     if len(jobs) < 2:
         return jobs
-    try:
-        from . import ai_client as ai_module, analyzer, config  # noqa: F401
-    except ImportError:
-        import ai_client as ai_module, config  # type: ignore
-
+    ai_module, _, config = _ai_bits()
     cfg    = config.load()
     resume = config.load_resume_text(cfg)
     ai     = ai_module.AIClient(cfg["ai"])
 
-    # Compact representation - full JDs would blow the context for no gain.
     rows = []
     for j in jobs:
         llm = j.get("llm", {}) or {}
+        matched = "; ".join(
+            f"{k}:{','.join(v[:5])}" for k, v in (j.get("hits") or {}).items())
         rows.append(
             f"id={j['id']}\n"
             f"  title={j['title']}\n"
             f"  company={j['company']}  location={j.get('location','')}\n"
-            f"  matched={'; '.join(f'{k}:{",".join(v[:5])}' for k, v in (j.get('hits') or {}).items())}\n"
+            f"  matched={matched}\n"
             f"  llm_skills={llm.get('matching_skills','')}\n"
-            f"  llm_gaps={llm.get('gaps','')}"
-        )
+            f"  llm_gaps={llm.get('gaps','')}")
+
     user = (f"CANDIDATE RESUME:\n{resume[:6000]}\n\n"
-            f"ROLES TO RANK - there are exactly {len(jobs)}. Your JSON array MUST "
-            f"contain exactly {len(jobs)} objects, ranks 1..{len(jobs)}, every id "
-            f"used once. Do not truncate the list.\n\n" + "\n\n".join(rows))
+            f"ROLES TO RANK - there are exactly {len(jobs)}. Your JSON array "
+            f"MUST contain exactly {len(jobs)} objects, ranks 1..{len(jobs)}, "
+            f"every id used once. Do not truncate the list.\n\n"
+            + "\n\n".join(rows))
 
     if verbose:
         print(f"  ranking {len(jobs)} roles comparatively...", file=sys.stderr)
@@ -477,7 +688,7 @@ def rank_candidates(jobs: list[dict], verbose: bool = True) -> list[dict]:
         raw = ai.generate(RANK_SYSTEM, user, _endpoint="analyze")
         m = re.search(r"\[.*\]", raw, re.S)
         order = json.loads(m.group(0)) if m else []
-    except Exception as exc:                                  # noqa: BLE001
+    except Exception as exc:                                     # noqa: BLE001
         print(f"  !! ranking failed: {exc}", file=sys.stderr)
         return jobs
 
@@ -488,12 +699,146 @@ def rank_candidates(jobs: list[dict], verbose: bool = True) -> list[dict]:
             j["rank"]    = row.get("rank")
             j["verdict"] = row.get("verdict", "")
             j["why"]     = row.get("why", "")
-    ranked   = sorted((j for j in jobs if j.get("rank")), key=lambda x: x["rank"])
+    ranked   = sorted((j for j in jobs if j.get("rank")),
+                      key=lambda x: x["rank"])
     unranked = [j for j in jobs if not j.get("rank")]
     return ranked + unranked
 
 
-# ── report ───────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Scan
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_scan(prefilter_min: float | None = None, limit: int | None = None,
+             do_llm: bool = True, do_rank: bool = True,
+             include_seen: bool = True,
+             progress: Callable[[str, int, int], None] | None = None,
+             ) -> dict:
+    """Full scan across every enabled phase, persisted to disk.
+
+    include_seen defaults to True: a posting you have not acted on is still a
+    live opportunity, and hiding it was what made rescans look empty. Dismissed
+    and applied postings are always excluded.
+    """
+    def tick(stage: str, done: int = 0, total: int = 0) -> None:
+        if progress:
+            try:
+                progress(stage, done, total)
+            except Exception:                                    # noqa: BLE001
+                pass
+
+    def log(msg: str) -> None:
+        print(msg, file=sys.stderr)
+
+    cfg = load_config()
+    if prefilter_min is None:
+        prefilter_min = float(cfg.get("prefilter_min", 45.0))
+    if limit is None:
+        limit = int(cfg.get("llm_limit", 25))
+
+    registry = load_sources()
+    state    = _load_state()
+    seen     = state["seen"]
+    hidden   = set(state["dismissed"]) | set(state["applied"])
+
+    phases = [p for p in cfg.get("phases", []) if p.get("enabled", True)]
+    all_jobs: list[dict] = []
+    survivors: list[dict] = []
+    rejected = 0
+    per_phase: list[dict] = []
+
+    # Poll the registry once and share it - the phases differ in how they gate
+    # results, not in what the ATS boards return.
+    registry_jobs: list[dict] | None = None
+    if registry and any(p.get("use_registry", True) for p in phases):
+        tick("fetching: registry", 0, len(phases))
+        registry_jobs = src_mod.fetch_registry(registry)
+        log(f"registry: {len(registry_jobs)} postings from "
+            f"{len(registry)} companies")
+
+    for idx, phase in enumerate(phases, 1):
+        name = phase.get("name", f"phase {idx}")
+        tick(f"fetching: {name}", idx - 1, len(phases))
+        log(f"\n[{idx}/{len(phases)}] {name}")
+
+        raw = gather_phase(phase, cfg, registry, log, registry_jobs)
+        raw = [j for j in raw if j["id"] not in hidden]
+        all_jobs.extend(raw)
+
+        kept = []
+        for j in raw:
+            j.update(prefilter(j, phase.get("gate", "")))
+            if j["reject"]:
+                rejected += 1
+                continue
+            if j["prefilter_score"] >= prefilter_min:
+                kept.append(j)
+        log(f"  -> {len(kept)} passed prefilter (>= {prefilter_min})")
+        per_phase.append({"name": name, "fetched": len(raw), "kept": len(kept)})
+        survivors.extend(kept)
+
+    # Dedupe across phases and sources, then rank by the cheap score first so
+    # the LLM budget goes to the most promising postings.
+    before = len(survivors)
+    survivors = dedupe(survivors)
+    if before != len(survivors):
+        log(f"\ndeduped {before} -> {len(survivors)}")
+
+    for j in survivors:
+        j["is_new"] = j["id"] not in seen
+    survivors.sort(key=lambda x: (not x["is_new"], -x["prefilter_score"]))
+    tick("prefiltered", len(survivors), len(all_jobs))
+
+    shortlist = survivors[:limit]
+    if do_llm and shortlist:
+        _, _, config = _ai_bits()
+        if config.load_resume_text(config.load()).strip():
+            llm_score(shortlist, verbose=False,
+                      progress=lambda d, t: tick("scoring", d, t))
+            if do_rank and len(shortlist) > 1:
+                tick("ranking", 0, len(shortlist))
+                shortlist = rank_candidates(shortlist, verbose=False)
+        else:
+            log("!! no resume text - skipping LLM stage")
+
+    now = datetime.now(timezone.utc).isoformat()
+    for j in all_jobs:
+        seen.setdefault(j["id"], now)
+    _save_state(state)
+
+    # Drop the full JD - it is large and the UI does not need it.
+    slim = [{k: v for k, v in j.items() if k != "description"}
+            for j in shortlist]
+
+    payload = {
+        "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "counts": {
+            "sources": len(registry), "fetched": len(all_jobs),
+            "rejected": rejected, "survivors": len(survivors),
+            "shortlist": len(slim),
+            "new": sum(1 for j in slim if j.get("is_new")),
+        },
+        "phases": per_phase,
+        "jobs": slim,
+    }
+    LAST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    LAST_PATH.write_text(json.dumps(payload, indent=2))
+    tick("done", len(slim), len(slim))
+    return payload
+
+
+def load_last() -> dict:
+    if LAST_PATH.exists():
+        try:
+            return json.loads(LAST_PATH.read_text())
+        except ValueError:
+            pass
+    return {"generated": "", "counts": {}, "phases": [], "jobs": []}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Report
+# ══════════════════════════════════════════════════════════════════════════════
 
 def report(jobs: list[dict], min_score: float, prefilter_only: bool) -> str:
     key = "prefilter_score" if prefilter_only else "llm_score"
@@ -507,25 +852,32 @@ def report(jobs: list[dict], min_score: float, prefilter_only: bool) -> str:
              f"{len(keep)} scored >= {thresh} on `{key}`.", ""]
 
     if not keep:
-        lines += ["Nothing met the threshold. Lower it, or add sources to "
-                  "`~/.grapply/sources.json`.", ""]
+        lines += ["Nothing met the threshold. Lower it, add sources to "
+                  "`~/.grapply/sources.json`, or widen the phases in "
+                  "`~/.grapply/discovery_config.json`.", ""]
 
     if any(j.get("rank") for j in keep):
         keep.sort(key=lambda j: j.get("rank") or 999)
         lines += ["## Shortlist (ranked - your call)", "",
-                  "| # | Role | Company | Location | Verdict | Why |",
-                  "|---|------|---------|----------|---------|-----|"]
+                  "| # | Role | Company | Location | Salary | Verdict | Why |",
+                  "|---|------|---------|----------|--------|---------|-----|"]
         for j in keep:
             lines.append(
                 f"| {j.get('rank','')} | {j['title']} | {j['company']} | "
-                f"{j.get('location','')} | **{j.get('verdict','')}** | "
-                f"{j.get('why','')} |")
+                f"{j.get('location','')} | {j.get('salary','') or '-'} | "
+                f"**{j.get('verdict','')}** | {j.get('why','')} |")
         lines.append("")
 
     for j in keep:
-        lines.append(f"## {j['title']} - {j['company']}")
+        flag = " (new)" if j.get("is_new") else ""
+        lines.append(f"## {j['title']} - {j['company']}{flag}")
         lines.append("")
         lines.append(f"- **Location:** {j.get('location') or 'not stated'}")
+        if j.get("salary"):
+            lines.append(f"- **Salary:** {j['salary']}")
+        lines.append(f"- **Source:** {j.get('source','')}"
+                     + (f" (also on {', '.join(j['also_on'])})"
+                        if j.get("also_on") else ""))
         lines.append(f"- **URL:** {j.get('url','')}")
         lines.append(f"- **Prefilter:** {j.get('prefilter_score')}/100")
         if not prefilter_only and "llm" in j:
@@ -538,10 +890,9 @@ def report(jobs: list[dict], min_score: float, prefilter_only: bool) -> str:
                     if isinstance(v, list):
                         v = ", ".join(str(x) for x in v)
                     lines.append(f"- **{fld.replace('_',' ').title()}:** {v}")
-        hits = j.get("hits", {})
-        if hits:
+        if j.get("hits"):
             lines.append("- **Matched:** " + "; ".join(
-                f"{k}: {', '.join(v[:6])}" for k, v in hits.items()))
+                f"{k}: {', '.join(v[:6])}" for k, v in j["hits"].items()))
         if j.get("penalties"):
             lines.append("- **Penalties:** " + ", ".join(j["penalties"]))
         for n in j.get("notes", []):
@@ -550,159 +901,76 @@ def report(jobs: list[dict], min_score: float, prefilter_only: bool) -> str:
     return "\n".join(lines)
 
 
-# ── programmatic entry point (used by the companion HTTP API) ────────────────
-
-def run_scan(prefilter_min: float = 55.0, limit: int = 25,
-             do_llm: bool = True, do_rank: bool = True,
-             include_seen: bool = False,
-             progress: "callable | None" = None) -> dict:
-    """Full scan, returning structured results and persisting them to disk.
-
-    progress(stage: str, done: int, total: int) is called as work proceeds so a
-    UI can show something during the ~2 minutes an LLM pass takes.
-    """
-    def tick(stage: str, done: int = 0, total: int = 0) -> None:
-        if progress:
-            try:
-                progress(stage, done, total)
-            except Exception:                              # noqa: BLE001
-                pass
-
-    sources = load_sources()
-    tick("fetching", 0, len(sources))
-    jobs = fetch_all(sources, verbose=False)
-    tick("fetched", len(jobs), len(jobs))
-
-    state = _load_state()
-    seen  = state.setdefault("seen", {})
-
-    survivors, rejected = [], 0
-    for j in jobs:
-        if not include_seen and j["id"] in seen:
-            continue
-        j.update(prefilter(j))
-        if j["reject"]:
-            rejected += 1
-            continue
-        if j["prefilter_score"] >= prefilter_min:
-            survivors.append(j)
-    survivors.sort(key=lambda x: x["prefilter_score"], reverse=True)
-    tick("prefiltered", len(survivors), len(jobs))
-
-    survivors = survivors[:limit]
-    if do_llm and survivors:
-        try:
-            from . import ai_client as ai_module, analyzer, config
-        except ImportError:
-            import ai_client as ai_module, analyzer, config      # type: ignore
-        cfg    = config.load()
-        resume = config.load_resume_text(cfg)
-        if resume.strip():
-            ai = ai_module.AIClient(cfg["ai"])
-            for i, job in enumerate(survivors, 1):
-                tick("scoring", i, len(survivors))
-                try:
-                    res = analyzer.score_job_fit(
-                        job.get("description", ""), resume, ai)
-                except Exception as exc:                     # noqa: BLE001
-                    res = {"error": str(exc), "score": 0}
-                job["llm"] = res
-                job["llm_score"] = float(res.get("score", 0) or 0)
-            if do_rank and len(survivors) > 1:
-                tick("ranking", 0, len(survivors))
-                survivors = rank_candidates(survivors, verbose=False)
-
-    for j in jobs:
-        seen.setdefault(j["id"], datetime.now(timezone.utc).isoformat())
-    _save_state(state)
-
-    # Drop the full JD text - it is large and the UI does not need it.
-    slim = []
-    for j in survivors:
-        slim.append({k: v for k, v in j.items() if k != "description"})
-
-    payload = {
-        "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "counts": {"sources": len(sources), "fetched": len(jobs),
-                   "rejected": rejected, "shortlist": len(slim)},
-        "jobs": slim,
-    }
-    LAST_PATH.parent.mkdir(parents=True, exist_ok=True)
-    LAST_PATH.write_text(json.dumps(payload, indent=2))
-    tick("done", len(slim), len(slim))
-    return payload
-
-
-def load_last() -> dict:
-    """Most recent scan results, or an empty shell if none have run."""
-    if LAST_PATH.exists():
-        try:
-            return json.loads(LAST_PATH.read_text())
-        except ValueError:
-            pass
-    return {"generated": "", "counts": {}, "jobs": []}
-
-
-# ── cli ──────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# CLI
+# ══════════════════════════════════════════════════════════════════════════════
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="grapply job discovery")
     ap.add_argument("--min-score", type=float, default=7.5,
-                    help="LLM fit threshold 0-10 (default 7.5 = your 75%%)")
-    ap.add_argument("--prefilter-min", type=float, default=45.0,
+                    help="LLM fit threshold 0-10 (default 7.5)")
+    ap.add_argument("--prefilter-min", type=float, default=None,
                     help="keyword score needed to reach the LLM stage")
     ap.add_argument("--prefilter-only", action="store_true",
                     help="no LLM - fast keyword triage only")
-    ap.add_argument("--all", action="store_true",
-                    help="include postings already seen")
-    ap.add_argument("--validate", action="store_true",
-                    help="check which sources respond, then exit")
+    ap.add_argument("--no-rank", action="store_true",
+                    help="skip the comparative ranking pass")
     ap.add_argument("--rank", action="store_true",
-                    help="second LLM pass: rank the shortlist comparatively")
-    ap.add_argument("--limit", type=int, default=25,
+                    help="(default) rank the shortlist comparatively")
+    ap.add_argument("--limit", type=int, default=None,
                     help="max postings sent to the LLM stage")
+    ap.add_argument("--phase", default="",
+                    help="run only the phase whose name contains this")
+    ap.add_argument("--validate", action="store_true",
+                    help="check which registry sources respond, then exit")
+    ap.add_argument("--discover", default="",
+                    help="find a company's ATS board from its website")
+    ap.add_argument("--add", action="store_true",
+                    help="with --discover, append hits to sources.json")
     ap.add_argument("-o", "--out", default="",
                     help="write the report here (default: stdout)")
     args = ap.parse_args(argv)
 
-    sources = load_sources()
-    print(f"sources: {len(sources)} (edit {SOURCES_PATH})", file=sys.stderr)
-
-    if args.validate:
-        fetch_all(sources)
+    if args.discover:
+        rows = src_mod.discover_ats(args.discover)
+        if not rows:
+            print("no ATS board found", file=sys.stderr)
+            return 1
+        for r in rows:
+            ok, n = src_mod.validate_source(r)
+            print(f"  {r['ats']:<16} {r['slug']:<24} {n:>4} jobs")
+        if args.add:
+            reg = load_sources()
+            known = {(s.get("ats"), s.get("slug")) for s in reg}
+            added = [r for r in rows if (r["ats"], r["slug"]) not in known]
+            save_sources(reg + added)
+            print(f"added {len(added)} source(s) to {SOURCES_PATH}",
+                  file=sys.stderr)
         return 0
 
-    jobs = fetch_all(sources)
-    print(f"fetched {len(jobs)} postings", file=sys.stderr)
+    if args.validate:
+        for s in load_sources():
+            ok, n = src_mod.validate_source(s)
+            print(f"  {'ok' if ok else '--'} {s.get('ats',''):<16} "
+                  f"{s.get('name', s.get('slug','')):<24} {n:>4}")
+        return 0
 
-    state = _load_state()
-    seen  = state.setdefault("seen", {})
+    cfg = load_config()
+    if args.phase:
+        for p in cfg["phases"]:
+            p["enabled"] = args.phase.lower() in p.get("name", "").lower()
+        save_config(cfg)
 
-    survivors = []
-    for j in jobs:
-        if not args.all and j["id"] in seen:
-            continue
-        j.update(prefilter(j))
-        if j["reject"]:
-            continue
-        if j["prefilter_score"] >= args.prefilter_min:
-            survivors.append(j)
+    payload = run_scan(prefilter_min=args.prefilter_min, limit=args.limit,
+                       do_llm=not args.prefilter_only,
+                       do_rank=not args.no_rank)
 
-    survivors.sort(key=lambda x: x["prefilter_score"], reverse=True)
-    print(f"{len(survivors)} passed prefilter (>= {args.prefilter_min})",
-          file=sys.stderr)
+    c = payload["counts"]
+    print(f"\nfetched {c['fetched']}, rejected {c['rejected']}, "
+          f"survivors {c['survivors']}, shortlist {c['shortlist']} "
+          f"({c['new']} new)", file=sys.stderr)
 
-    if not args.prefilter_only and survivors:
-        survivors = llm_score(survivors[: args.limit])
-        if args.rank:
-            survivors = rank_candidates(survivors)
-
-    text = report(survivors, args.min_score, args.prefilter_only)
-
-    for j in jobs:
-        seen.setdefault(j["id"], datetime.now(timezone.utc).isoformat())
-    _save_state(state)
-
+    text = report(payload["jobs"], args.min_score, args.prefilter_only)
     if args.out:
         p = Path(args.out).expanduser()
         p.parent.mkdir(parents=True, exist_ok=True)
