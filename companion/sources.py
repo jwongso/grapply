@@ -350,9 +350,16 @@ query jobDetails($jobId: ID!) {
 def seek_search(keywords: str, *, site: str = "nz", where: str = "",
                 max_jobs: int = 200, date_range: int = 31) -> list[dict]:
     """Search Seek. Returns stubs with a teaser, not the full JD - call
-    seek_hydrate() on the ones that survive triage."""
+    seek_hydrate() on the ones that survive triage.
+
+    date_range is in days. Seek only honours 1/3/7/14/31 and silently ignores
+    anything else, handing back the unfiltered list, so the request is rounded
+    up to the nearest bucket it accepts.
+    """
     base, site_key, cc, default_where = SEEK_SITES.get(site, SEEK_SITES["nz"])
     where = where or default_where
+    date_range = min((d for d in (1, 3, 7, 14, 31) if d >= date_range),
+                     default=31)
     out: list[dict] = []
     page = 1
     while len(out) < max_jobs and page <= 25:

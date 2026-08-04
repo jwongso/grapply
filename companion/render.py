@@ -713,6 +713,11 @@ SITE_PROFILES: dict[str, dict] = {
         "url": lambda kw, page: (
             f"https://nz.indeed.com/jobs?q={kw.replace(' ', '+')}"
             f"&start={(page - 1) * 10}"),
+        # Indeed only honours fromage=1/3/7/14; anything else is ignored
+        # silently and you get the unfiltered list back, so round up to the
+        # nearest bucket it accepts rather than passing the raw request.
+        "fresh_param": lambda days: "fromage={}".format(
+            min((d for d in (1, 3, 7, 14) if d >= days), default=14)),
         # Verified working 2026-08-02: plain HTTP gets a hard 403 on the first
         # request, but landing on the homepage and typing the query returns 506
         # responses with no 403 at all and 16 result cards per page.
@@ -756,9 +761,24 @@ SITE_PROFILES: dict[str, dict] = {
 }
 
 
+def _profile_url(prof: dict, keywords: str, page: int, since_days: int) -> str:
+    """Profile URL for a page, with the site's freshness filter appended.
+
+    Server-side filtering is an optimisation only: it saves fetching pages of
+    stale postings. Correctness comes from discovery's own date filter, which
+    applies to every source including the ones with no such parameter.
+    """
+    url = prof["url"](keywords, page)
+    fresh = prof.get("fresh_param")
+    if since_days > 0 and fresh:
+        url += ("&" if "?" in url else "?") + fresh(since_days)
+    return url
+
+
 def fetch_profile(name: str, keywords: str, *, max_jobs: int = 100,
                   max_pages: int = 3, headless: bool = True,
                   engine: str = "chromium", device: str = "desktop",
+                  since_days: int = 0,
                   session: BrowserSession | None = None,
                   on_payload: Callable[[str, Any], None] | None = None,
                   on_page: Callable[[str, int, int, int], None] | None = None,
@@ -796,7 +816,8 @@ def fetch_profile(name: str, keywords: str, *, max_jobs: int = 100,
 
         try:
             rows = sess.harvest_dom(
-                prof["url"](keywords, 1), name, dom_spec, learned,
+                _profile_url(prof, keywords, 1, since_days),
+                name, dom_spec, learned,
                 max_pages=max_pages, max_jobs=max_jobs,
                 warmup=prof.get("warmup", ""),
                 search_selector=prof.get("search_selector", ""),
@@ -833,7 +854,7 @@ def fetch_profile(name: str, keywords: str, *, max_jobs: int = 100,
         for page_no in range(1, max_pages + 1):
             if len(jobs) >= max_jobs:
                 break
-            url = prof["url"](keywords, page_no)
+            url = _profile_url(prof, keywords, page_no, since_days)
 
             payloads = sess.capture_json(
                 url, prof["capture"],
@@ -899,7 +920,7 @@ def fetch_profile(name: str, keywords: str, *, max_jobs: int = 100,
 def fetch_profiles(names: Iterable[str], keywords: str, *,
                    max_jobs: int = 100, max_pages: int = 4,
                    headless: bool = True, engine: str = "rotate",
-                   device: str = "desktop",
+                   device: str = "desktop", since_days: int = 0,
                    on_page: Callable[[str, int, int, int], None] | None = None,
                    ) -> list[dict]:
     """Run several profiles, one browser per site.
@@ -934,7 +955,7 @@ def fetch_profiles(names: Iterable[str], keywords: str, *,
                                 device=dev) as sess:
                 got = fetch_profile(n, keywords, max_jobs=max_jobs,
                                     max_pages=max_pages, session=sess,
-                                    on_page=on_page)
+                                    since_days=since_days, on_page=on_page)
             print(f"  {n:<12} {eng:<9} {dev:<8} "
                   f"{'headed' if not head else 'headless':<8} "
                   f"{len(got):>4} jobs", file=sys.stderr)

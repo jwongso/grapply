@@ -310,6 +310,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     ],
     "prefilter_min": 45.0,
     "llm_limit": 25,
+    # Only consider postings newer than this many days. 0 disables the filter
+    # and every posting a source returns is considered, which is the default:
+    # a role posted three weeks ago is still open. Set it (or pass --since-days)
+    # when the standing list has gone stale and you only want what is new.
+    "max_age_days": 0,
     # Seek detail calls per phase. This is a total now that stubs are
     # de-duplicated across keywords, not a per-keyword budget - set it below
     # the unique candidate count and you silently throw away good matches.
@@ -360,6 +365,79 @@ def save_sources(rows: list[dict]) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 # State - remember, but do not hide
 # ══════════════════════════════════════════════════════════════════════════════
+
+def parse_posted(value: Any) -> datetime | None:
+    """Best-effort parse of a source's `posted` field to an aware UTC datetime.
+
+    Every source spells this differently: Seek and the ATS boards emit ISO
+    8601, the RSS-backed aggregators emit RFC 2822 pubDates, and a couple hand
+    back epoch seconds or milliseconds. Returns None when it cannot tell, which
+    the caller must treat as unknown rather than old.
+    """
+    if value is None or value == "":
+        return None
+
+    # Epochs arrive as both ints and digit strings, in seconds and in ms.
+    if isinstance(value, (int, float)) or (
+            isinstance(value, str) and value.strip().isdigit()):
+        n = float(value)
+        if n <= 0:
+            return None
+        if n > 1e11:                       # milliseconds
+            n /= 1000.0
+        try:
+            return datetime.fromtimestamp(n, timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+
+    s = str(value).strip()
+    iso = s.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(iso)
+    except ValueError:
+        try:
+            from email.utils import parsedate_to_datetime   # noqa: PLC0415
+            dt = parsedate_to_datetime(s)
+        except (TypeError, ValueError, IndexError):
+            return None
+    if dt is None:
+        return None
+    # A bare date parses to naive midnight; treat it as UTC rather than local
+    # so the comparison does not drift by a timezone offset.
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def filter_by_age(jobs: list[dict], days: int,
+                  log: Callable[[str], None] | None = None) -> list[dict]:
+    """Keep postings newer than `days`. days <= 0 disables the filter.
+
+    Postings whose date cannot be parsed are KEPT, not dropped. Dropping them
+    would silently discard real openings whenever a source stops populating a
+    date, which is a much worse failure than letting a few stale ones through.
+    The count is logged so a source that has gone dateless is visible.
+    """
+    if days <= 0:
+        return jobs
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    kept, dropped, undated = [], 0, 0
+    for j in jobs:
+        dt = parse_posted(j.get("posted"))
+        if dt is None:
+            undated += 1
+            kept.append(j)
+        elif dt >= cutoff:
+            kept.append(j)
+        else:
+            dropped += 1
+    if log and (dropped or undated):
+        msg = f"  freshness (<= {days}d): dropped {dropped} older postings"
+        if undated:
+            msg += f", kept {undated} with no usable date"
+        log(msg)
+    return kept
+
 
 def _load_state() -> dict:
     if STATE_PATH.exists():
@@ -632,6 +710,9 @@ def gather_phase(phase: dict, cfg: dict, registry: list[dict],
     """
     jobs: list[dict] = []
     gate = phase.get("gate", "")
+    # Seek and Indeed can filter by age server-side, which saves paging through
+    # stale results; every other source is filtered on the way out below.
+    max_age = int(cfg.get("max_age_days", 0) or 0)
 
     # A phase is minutes of work, so reporting only "phase 1 of 2" leaves the
     # progress bar frozen and looking crashed. Report the sub-steps instead.
@@ -660,7 +741,8 @@ def gather_phase(phase: dict, cfg: dict, registry: list[dict],
             step(f"Searching Seek for \"{kw}\"", n - 1, len(kws))
             try:
                 stubs = src_mod.seek_search(
-                    kw, site=site, max_jobs=phase.get("max_jobs", 300))
+                    kw, site=site, max_jobs=phase.get("max_jobs", 300),
+                    date_range=max_age or 31)
             except Exception as exc:                             # noqa: BLE001
                 log(f"  seek-{site} '{kw}': failed ({exc})")
                 continue
@@ -728,7 +810,7 @@ def gather_phase(phase: dict, cfg: dict, registry: list[dict],
                 try:
                     got = render.fetch_profiles(
                         profiles, kw, max_jobs=phase.get("max_jobs", 100),
-                        max_pages=pages,
+                        max_pages=pages, since_days=max_age,
                         headless=cfg.get("headless", True),
                         engine=cfg.get("browser_engine", "rotate"),
                         device=cfg.get("browser_device", "desktop"),
@@ -742,6 +824,11 @@ def gather_phase(phase: dict, cfg: dict, registry: list[dict],
                 jobs.extend(got)
             if len(jobs) == before:
                 log("  browser returned nothing - JSON sources still apply")
+
+    # Applied once, here, so the guarantee holds for every source rather than
+    # only the two that accept a date parameter. The server-side params above
+    # just mean there is less to throw away.
+    jobs = filter_by_age(jobs, max_age, log)
 
     for j in jobs:
         j.setdefault("phase", phase.get("name", gate))
@@ -862,7 +949,7 @@ def rank_candidates(jobs: list[dict], verbose: bool = True) -> list[dict]:
 
 def run_scan(prefilter_min: float | None = None, limit: int | None = None,
              do_llm: bool = True, do_rank: bool = True,
-             include_seen: bool = True,
+             include_seen: bool = True, since_days: int | None = None,
              progress: Callable[[str, int, int], None] | None = None,
              ) -> dict:
     """Full scan across every enabled phase, persisted to disk.
@@ -870,6 +957,11 @@ def run_scan(prefilter_min: float | None = None, limit: int | None = None,
     include_seen defaults to True: a posting you have not acted on is still a
     live opportunity, and hiding it was what made rescans look empty. Dismissed
     and applied postings are always excluded.
+
+    since_days limits results to postings newer than that many days, overriding
+    the config's max_age_days. This is the other half of the same problem: with
+    seen postings shown, a scan is dominated by the same long-lived listings
+    every time, and a fresh-only scan is how you see just what appeared since.
     """
     def tick(stage: str, done: int = 0, total: int = 0) -> None:
         if progress:
@@ -886,6 +978,11 @@ def run_scan(prefilter_min: float | None = None, limit: int | None = None,
         prefilter_min = float(cfg.get("prefilter_min", 45.0))
     if limit is None:
         limit = int(cfg.get("llm_limit", 25))
+    if since_days is not None:
+        cfg = dict(cfg, max_age_days=int(since_days))
+    max_age = int(cfg.get("max_age_days", 0) or 0)
+    if max_age > 0:
+        log(f"freshness: postings from the last {max_age} day(s) only")
 
     registry = load_sources()
     state    = _load_state()
@@ -1081,6 +1178,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="max postings sent to the LLM stage")
     ap.add_argument("--phase", default="",
                     help="run only the phase whose name contains this")
+    ap.add_argument("--since-days", type=int, default=None, metavar="N",
+                    help="only postings from the last N days (0 = no limit)")
+    ap.add_argument("--fresh", action="store_true",
+                    help="only what was posted in the last 24h "
+                         "(same as --since-days 1)")
     ap.add_argument("--validate", action="store_true",
                     help="check which registry sources respond, then exit")
     ap.add_argument("--discover", default="",
@@ -1121,9 +1223,10 @@ def main(argv: list[str] | None = None) -> int:
             p["enabled"] = args.phase.lower() in p.get("name", "").lower()
         save_config(cfg)
 
+    since = 1 if args.fresh else args.since_days
     payload = run_scan(prefilter_min=args.prefilter_min, limit=args.limit,
                        do_llm=not args.prefilter_only,
-                       do_rank=not args.no_rank)
+                       do_rank=not args.no_rank, since_days=since)
 
     c = payload["counts"]
     print(f"\nfetched {c['fetched']}, rejected {c['rejected']}, "

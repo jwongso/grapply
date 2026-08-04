@@ -1772,7 +1772,8 @@ _DISCOVERY_STATE: dict = {"running": False, "stage": "idle", "done": 0,
 
 
 def _discovery_worker(prefilter_min: float | None, limit: int | None,
-                      do_llm: bool, do_rank: bool, include_seen: bool) -> None:
+                      do_llm: bool, do_rank: bool, include_seen: bool,
+                      since_days: int | None = None) -> None:
     import discovery
     def progress(stage: str, done: int, total: int) -> None:
         _DISCOVERY_STATE.update(stage=stage, done=done, total=total)
@@ -1781,7 +1782,8 @@ def _discovery_worker(prefilter_min: float | None, limit: int | None,
                                 total=0, error="", finished="")
         discovery.run_scan(prefilter_min=prefilter_min, limit=limit,
                            do_llm=do_llm, do_rank=do_rank,
-                           include_seen=include_seen, progress=progress)
+                           include_seen=include_seen, since_days=since_days,
+                           progress=progress)
     except Exception as exc:                                    # noqa: BLE001
         logger.exception("[discovery] scan failed")
         _DISCOVERY_STATE.update(error=str(exc), stage="error")
@@ -1867,6 +1869,7 @@ def discovery_run_endpoint(
     llm: bool = True,
     rank: bool = True,
     include_seen: bool = True,
+    since_days: int | None = None,
     _: None = Depends(_require_token),
 ):
     if _DISCOVERY_STATE["running"]:
@@ -1874,7 +1877,7 @@ def discovery_run_endpoint(
     import threading
     threading.Thread(
         target=_discovery_worker,
-        args=(prefilter_min, limit, llm, rank, include_seen),
+        args=(prefilter_min, limit, llm, rank, include_seen, since_days),
         daemon=True,
     ).start()
     return {"started": True}
@@ -1962,6 +1965,19 @@ _DISCOVERY_HTML = """<!DOCTYPE html>
         <input id="lim" type="number" value="25" min="1" max="100">
         <div class="hint">Only the best this-many get read by the AI, because
           that part is slow. 25 takes a couple of minutes.</div>
+      </div>
+      <div class="fld">
+        <label for="since">Posted within</label>
+        <select id="since">
+          <option value="0" selected>Any time</option>
+          <option value="1">Last 24 hours</option>
+          <option value="3">Last 3 days</option>
+          <option value="7">Last week</option>
+          <option value="14">Last 2 weeks</option>
+        </select>
+        <div class="hint">"Last 24 hours" shows only what appeared since
+          yesterday, which is what you want on a rescan. Postings whose date a
+          board does not publish are kept rather than guessed at.</div>
       </div>
       <div style="min-width:280px">
         <div class="opt">
@@ -2099,7 +2115,7 @@ $('run').onclick = async () => {
   const q = new URLSearchParams({
     prefilter_min: $('pf').value, limit: $('lim').value,
     llm: $('llm').checked, rank: $('rank').checked,
-    include_seen: $('seen').checked });
+    include_seen: $('seen').checked, since_days: $('since').value });
   const r = await fetch('/discovery/run?' + q, {method:'POST', headers:H});
   if (!r.ok){ $('status').textContent = 'error: ' + (await r.text()); return; }
   $('run').disabled = true;
