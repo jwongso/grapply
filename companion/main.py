@@ -1773,7 +1773,8 @@ _DISCOVERY_STATE: dict = {"running": False, "stage": "idle", "done": 0,
 
 def _discovery_worker(prefilter_min: float | None, limit: int | None,
                       do_llm: bool, do_rank: bool, include_seen: bool,
-                      since_days: int | None = None) -> None:
+                      since_days: int | None = None,
+                      market: str | None = None) -> None:
     import discovery
     def progress(stage: str, done: int, total: int) -> None:
         _DISCOVERY_STATE.update(stage=stage, done=done, total=total)
@@ -1783,7 +1784,7 @@ def _discovery_worker(prefilter_min: float | None, limit: int | None,
         discovery.run_scan(prefilter_min=prefilter_min, limit=limit,
                            do_llm=do_llm, do_rank=do_rank,
                            include_seen=include_seen, since_days=since_days,
-                           progress=progress)
+                           market=market, progress=progress)
     except Exception as exc:                                    # noqa: BLE001
         logger.exception("[discovery] scan failed")
         _DISCOVERY_STATE.update(error=str(exc), stage="error")
@@ -1830,7 +1831,14 @@ def discovery_config_endpoint():
         profiles = sorted(render.SITE_PROFILES)
     except Exception:                                           # noqa: BLE001
         engines, browser, profiles = [], False, []
+    markets = {}
+    for name in sorted(set(discovery.MARKETS) | set(cfg.get("markets") or {})):
+        try:
+            markets[name] = discovery.resolve_market(name, cfg)["label"]
+        except ValueError:
+            continue
     return {"config": cfg, "path": str(discovery.CONFIG_PATH),
+            "markets": markets,
             "browser": {"available": browser, "engines": engines,
                         "profiles": profiles}}
 
@@ -1870,14 +1878,22 @@ def discovery_run_endpoint(
     rank: bool = True,
     include_seen: bool = True,
     since_days: int | None = None,
+    market: str | None = None,
     _: None = Depends(_require_token),
 ):
     if _DISCOVERY_STATE["running"]:
         raise HTTPException(status_code=409, detail="A scan is already running")
+    if market:
+        import discovery
+        try:
+            discovery.resolve_market(market, discovery.load_config())
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
     import threading
     threading.Thread(
         target=_discovery_worker,
-        args=(prefilter_min, limit, llm, rank, include_seen, since_days),
+        args=(prefilter_min, limit, llm, rank, include_seen, since_days,
+              market or None),
         daemon=True,
     ).start()
     return {"started": True}
@@ -1965,6 +1981,15 @@ _DISCOVERY_HTML = """<!DOCTYPE html>
         <input id="lim" type="number" value="25" min="1" max="100">
         <div class="hint">Only the best this-many get read by the AI, because
           that part is slow. 25 takes a couple of minutes.</div>
+      </div>
+      <div class="fld">
+        <label for="market">Where to look</label>
+        <select id="market">
+          <option value="" selected>As configured (all enabled phases)</option>
+        </select>
+        <div class="hint">Pick a country to run a one-off scan of just that
+          market - the company pages, the right job boards, and a location
+          filter for someone based there. Does not change your saved phases.</div>
       </div>
       <div class="fld">
         <label for="since">Posted within</label>
@@ -2116,6 +2141,7 @@ $('run').onclick = async () => {
     prefilter_min: $('pf').value, limit: $('lim').value,
     llm: $('llm').checked, rank: $('rank').checked,
     include_seen: $('seen').checked, since_days: $('since').value });
+  if ($('market').value) q.set('market', $('market').value);
   const r = await fetch('/discovery/run?' + q, {method:'POST', headers:H});
   if (!r.ok){ $('status').textContent = 'error: ' + (await r.text()); return; }
   $('run').disabled = true;
@@ -2137,9 +2163,10 @@ function renderPhases(){
         <input type="checkbox" data-en="${i}" ${p.enabled !== false ? 'checked' : ''}>
         <b style="color:var(--text)">${p.name}</b>
         <span class="meta">&nbsp;${
-          p.gate === 'nz' ? 'keeps only jobs you could do from New Zealand'
-        : p.gate === 'remote' ? 'keeps only fully remote jobs'
-        : 'keeps everything'}${
+          (m => m === 'nz' ? 'keeps only jobs you could do from New Zealand'
+             : m === 'remote' ? 'keeps only fully remote jobs'
+             : m ? ('location filter: ' + m)
+             : 'keeps everything')(p.market || p.gate)}${
           (p.browser_profiles||[]).length
             ? ' · opens a browser for ' + p.browser_profiles
                 .map(s => s.replace('-nz','').replace(/^./, m => m.toUpperCase()))
@@ -2158,6 +2185,14 @@ async function loadConfig(){
   try{
     const d = await fetch('/discovery/config', {headers:H}).then(r=>r.json());
     CFG = d.config; renderPhases();
+    const sel = $('market');
+    if (d.markets && sel.options.length <= 1){
+      for (const [k, label] of Object.entries(d.markets)){
+        const o = document.createElement('option');
+        o.value = k; o.textContent = label;
+        sel.appendChild(o);
+      }
+    }
     $('kwstatus').textContent = d.browser && d.browser.available
       ? '' : 'browser sources unavailable (playwright not installed)';
   }catch(e){ $('kwstatus').textContent = 'could not load config'; }

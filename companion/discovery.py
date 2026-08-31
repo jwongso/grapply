@@ -12,6 +12,10 @@ that does not.
   phase 1  New Zealand   Seek NZ + the company registry
   phase 2  Remote        remote aggregators + the registry
 
+Each phase names a market (discovery.MARKETS) that supplies its location gate
+and its default sources. Markets are data, so scanning a different country is a
+config edit or a one-off `--market germany` - not a code change.
+
 Scoring stays two-stage, because running an LLM over every posting is wasteful
 when Seek alone returns hundreds:
 
@@ -23,6 +27,8 @@ showing an empty or week-old list: everything had been seen once, so nothing
 survived. A posting now disappears only when you dismiss or apply to it.
 
   python -m companion.discovery --validate       # check the registry
+  python -m companion.discovery --list-markets   # show the known markets
+  python -m companion.discovery --market germany # one-off scan of a market
   python -m companion.discovery --prefilter-only # no LLM, fast triage
   python -m companion.discovery --rank           # full run
 """
@@ -197,6 +203,193 @@ WORK_AUTH_BLOCK = (
     "eu work permit",
 )
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Markets - the geography half of a scan, made data instead of code
+# ══════════════════════════════════════════════════════════════════════════════
+# A phase used to carry a hard-coded gate string ("nz" / "remote") and the gate
+# logic branched on it against module-level term tuples. That made "scan Germany
+# instead" a code change. A market is the same information as data:
+#
+#   in_market         office locations that put a posting in this market
+#   reachable_remote  region tokens a person based here can work remotely for
+#   work_auth_block   JD phrases that gate on work rights a person here lacks
+#   require_remote    reject anything that is not remote (worldwide-style phase)
+#   seek_sites / aggregators / browser_profiles / where
+#                     the sources that make sense for this market, used when a
+#                     phase does not name its own
+#
+# Everything else about a scan (candidate profile, scoring, dedupe) is
+# geography-independent. Add a market here and it is immediately selectable from
+# the CLI (--market) and the discovery page. A phase picks one with
+# `"market": "<name>"`; the legacy `"gate"` key is still honoured as an alias.
+
+DEFAULT_KEYWORDS: list[str] = [
+    "senior software engineer", "senior software developer", "c++",
+    "c# .net", "python developer", "embedded software", "firmware",
+]
+
+# A JD that plainly says work-from-anywhere clears the gate for every market,
+# even when it also prints a head-office city.
+_REMOTE_ANYWHERE = ("worldwide", "world wide", "anywhere in the world",
+                    "from anywhere", "work from anywhere", "globally remote",
+                    "fully distributed")
+
+_US_AUTH_BLOCK = (
+    "must be authorized to work in the us",
+    "must be authorised to work in the us",
+    "must be legally authorized to work in the united states",
+    "us work authorization required",
+    "eligible to work in the us",
+    "must reside in the united states",
+    "must be based in the us",
+    "must be located in the united states",
+)
+
+
+def _mk(label: str, *, where: str = "",
+        seek_sites: tuple[str, ...] = (),
+        browser_profiles: tuple[str, ...] = (),
+        aggregators: tuple[str, ...] = ("arbeitnow", "remoteok", "remotive",
+                                        "jobicy", "workingnomads", "himalayas"),
+        in_market: tuple[str, ...] = (),
+        reachable_remote: tuple[str, ...] = (),
+        work_auth_block: tuple[str, ...] = (),
+        require_remote: bool = False) -> dict[str, Any]:
+    return {
+        "label": label,
+        "where": where,
+        "seek_sites": list(seek_sites),
+        "browser_profiles": list(browser_profiles),
+        "aggregators": list(aggregators),
+        "in_market": tuple(t.lower() for t in in_market),
+        "reachable_remote": tuple(
+            dict.fromkeys(t.lower() for t in
+                          (("worldwide", "global", "anywhere", "international")
+                           + tuple(reachable_remote)))),
+        "work_auth_block": tuple(t.lower() for t in work_auth_block),
+        "require_remote": require_remote,
+    }
+
+
+MARKETS: dict[str, dict[str, Any]] = {
+    "nz": _mk(
+        "New Zealand", where="New Zealand", seek_sites=("nz",),
+        browser_profiles=("indeed-nz",),
+        in_market=NZ_TERMS,
+        reachable_remote=NZ_REACHABLE_REGIONS,
+        work_auth_block=_US_AUTH_BLOCK + (
+            "eligible to work in the uk", "right to work in the uk",
+            "eu work permit", "must be based in the eu",
+            "eligible to work in the eu"),
+    ),
+    "au": _mk(
+        "Australia", where="Australia", seek_sites=("au",),
+        in_market=("australia", "sydney", "melbourne", "brisbane", "perth",
+                   "canberra", "adelaide", "hobart", "gold coast", "au"),
+        reachable_remote=("australia", "new zealand", "apac", "asia pacific",
+                          "asia-pacific", "oceania", "anz"),
+        work_auth_block=_US_AUTH_BLOCK + (
+            "right to work in the uk", "eu work permit"),
+    ),
+    "germany": _mk(
+        "Germany", where="Germany",
+        aggregators=("arbeitnow", "remoteok", "remotive", "himalayas",
+                     "workingnomads"),
+        in_market=("germany", "deutschland", "berlin", "munich", "munchen",
+                   "muenchen", "hamburg", "frankfurt", "cologne", "koln",
+                   "koeln", "stuttgart", "dusseldorf", "duesseldorf", "leipzig",
+                   "dortmund", "dresden", "hannover", "hanover", "nuremberg",
+                   "nurnberg", "bremen", "karlsruhe", "mannheim", "dach",
+                   "de"),
+        reachable_remote=("germany", "deutschland", "europe", "european union",
+                          "eu", "emea", "eea", "cet", "cest",
+                          "central european", "dach", "remote europe",
+                          "europe-based", "europe based"),
+        work_auth_block=_US_AUTH_BLOCK + (
+            "right to work in the uk", "eligible to work in the uk",
+            "must be a u.s. citizen", "must be a us citizen"),
+    ),
+    "uk": _mk(
+        "United Kingdom",
+        aggregators=("arbeitnow", "remoteok", "remotive", "himalayas",
+                     "workingnomads"),
+        in_market=("united kingdom", "uk", "england", "scotland", "wales",
+                   "london", "manchester", "birmingham", "edinburgh",
+                   "glasgow", "bristol", "leeds", "cambridge", "oxford"),
+        reachable_remote=("united kingdom", "uk", "europe", "emea", "eu",
+                          "gmt", "bst", "gb"),
+        work_auth_block=_US_AUTH_BLOCK,
+    ),
+    "eu-remote": _mk(
+        "Europe (remote)",
+        in_market=(),
+        reachable_remote=("europe", "european union", "eu", "emea", "eea",
+                          "cet", "cest", "central european", "dach", "gmt",
+                          "germany", "netherlands", "spain", "poland",
+                          "portugal", "france", "remote europe"),
+        work_auth_block=_US_AUTH_BLOCK,
+        require_remote=True,
+    ),
+    "remote": _mk(
+        "Remote worldwide",
+        in_market=(),
+        reachable_remote=tuple(NZ_REACHABLE_REGIONS),
+        work_auth_block=WORK_AUTH_BLOCK,
+        require_remote=True,
+    ),
+}
+
+
+def resolve_market(spec: Any, cfg: dict | None = None) -> dict | None:
+    """Turn a phase dict, a market-name string, or None into a market dict.
+
+    Returns None to mean "no location gate at all". Raises ValueError for a
+    name that is neither a built-in market nor defined in cfg["markets"], so a
+    typo in --market fails loudly instead of silently scanning the wrong place.
+    """
+    if spec is None:
+        return None
+    if isinstance(spec, str):
+        name = spec.strip().lower()
+    elif isinstance(spec, dict):
+        name = str(spec.get("market") or spec.get("gate") or "").strip().lower()
+    else:
+        return None
+    if not name:
+        return None
+
+    overrides = (cfg or {}).get("markets") or {}
+    if isinstance(overrides.get(name), dict):
+        base = dict(MARKETS.get(name) or _mk(name.replace("-", " ").title()))
+        base.update(overrides[name])
+        base.setdefault("label", name.replace("-", " ").title())
+        for key in ("in_market", "reachable_remote", "work_auth_block"):
+            base[key] = tuple(str(t).lower() for t in base.get(key, ()))
+        return base
+    if name in MARKETS:
+        return MARKETS[name]
+    raise ValueError(f"unknown market {name!r}; "
+                     f"known: {', '.join(sorted(MARKETS))}")
+
+
+def _synthetic_phase(name: str, market: dict, cfg: dict) -> dict:
+    """A one-off phase for `--market X` / `?market=X` - scan that market now,
+    without touching the saved phase configuration."""
+    return {
+        "name": market["label"],
+        "enabled": True,
+        "market": name,
+        "keywords": list(cfg.get("default_keywords") or DEFAULT_KEYWORDS),
+        "seek_sites": list(market.get("seek_sites", [])),
+        "aggregators": list(market.get("aggregators", [])),
+        "browser_profiles": list(market.get("browser_profiles", [])),
+        "browser_pages": 6,
+        "browser_keywords": 1,
+        "use_registry": True,
+        "max_jobs": 400,
+    }
+
+
 WEIGHTS: dict[str, tuple[int, tuple[str, ...]]] = {
     # Language buckets are weighted by preference, not by capability: C++ is
     # the deepest and best-evidenced, C#/.NET is real production experience,
@@ -276,7 +469,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         {
             "name": "New Zealand",
             "enabled": True,
-            "gate": "nz",
+            "market": "nz",
             # Searching "c++" alone is too narrow: boards tokenise the plus
             # signs unpredictably and plenty of matching roles never put it in
             # the title. Cast wide on job titles and let the prefilter enforce
@@ -298,7 +491,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         {
             "name": "Remote worldwide",
             "enabled": True,
-            "gate": "remote",
+            "market": "remote",
             "keywords": ["c++", "senior software engineer"],
             "seek_sites": [],
             "aggregators": ["arbeitnow", "remoteok", "remotive", "jobicy",
@@ -308,6 +501,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "max_jobs": 400,
         },
     ],
+    # Per-market overrides, keyed by market name. A dict here is merged over the
+    # built-in MARKETS entry (or creates a new market if the name is unknown),
+    # so a scan's geography can be tuned without editing code.
+    "markets": {},
+    # Keywords for an on-demand `--market X` scan, which has no phase of its own.
+    "default_keywords": DEFAULT_KEYWORDS,
     "prefilter_min": 45.0,
     "llm_limit": 25,
     # Only consider postings newer than this many days. 0 disables the filter
@@ -505,39 +704,39 @@ def _any(blob: str, terms: Iterable[str]) -> bool:
     return any(_has(blob, t) for t in terms)
 
 
-def _location_ok(job: dict, gate: str) -> tuple[bool, str]:
-    """Phase-aware location gate. Returns (ok, reason_if_not)."""
-    loc = src_mod.fold(job.get("location") or "").lower()
+def _location_ok(job: dict, market: dict | None) -> tuple[bool, str]:
+    """Location gate, driven entirely by a resolved market dict (see MARKETS).
+
+    Returns (ok, reason_if_not). market is None when the phase asks for no
+    location gate at all, in which case everything passes.
+    """
+    if not market:
+        return True, ""
+
+    loc  = src_mod.fold(job.get("location") or "").lower()
     body = src_mod.fold(job.get("description") or "").lower()[:3000]
     is_remote = bool(job.get("remote")) or _any(loc, REMOTE_TERMS)
 
-    if gate == "nz":
-        if _any(loc, NZ_TERMS):
+    # 1. Physically in the market. An office address settles it outright.
+    if market["in_market"] and _any(loc, market["in_market"]):
+        return True, ""
+
+    # 2. An explicit work-authorisation demand in the body overrides any
+    #    location string, which is often just a head-office address.
+    auth = next((t for t in market["work_auth_block"] if t and t in body), "")
+    if auth:
+        return False, f"needs work rights not held ('{auth}')"
+
+    # 3. Remote - but remote from where?
+    if is_remote or _any(body[:1500], REMOTE_TERMS):
+        if _any(loc, market["reachable_remote"]):
             return True, ""
-        # A worldwide-remote role is reachable from NZ, so it belongs here too.
-        if is_remote and _any(f"{loc} {body}",
-                              ("worldwide", "anywhere", "global",
-                               "new zealand")):
+        # A JD that plainly says work-from-anywhere, HQ city notwithstanding.
+        if _any(body[:900], _REMOTE_ANYWHERE):
             return True, ""
-        return False, f"not NZ-reachable: {job.get('location') or '?'}"
-
-    if gate == "remote":
-        if not (is_remote or _any(body[:1500], REMOTE_TERMS)):
-            return False, f"not remote: {job.get('location') or '?'}"
-
-        # Remote, but remote from where? An explicit work-authorisation demand
-        # settles it regardless of what the location says.
-        auth = next((t for t in WORK_AUTH_BLOCK if t in body), "")
-        if auth:
-            return False, f"needs work rights he lacks ('{auth}')"
-
-        if _any(loc, NZ_REACHABLE_REGIONS):
-            return True, ""
-
         # Strip the arrangement words. Whatever survives is a place, and since
         # it did not match the reachable list, it is a place he cannot work
-        # from. Inverting the test this way rejects unknown regions by default
-        # rather than needing every country enumerated.
+        # from. Rejecting unknown regions by default beats enumerating Earth.
         residue = loc
         for term in REMOTE_GENERIC:
             residue = residue.replace(term, " ")
@@ -545,19 +744,22 @@ def _location_ok(job: dict, gate: str) -> tuple[bool, str]:
         if residue:
             return False, (f"remote but region-locked: "
                            f"{job.get('location') or '?'}")
-
         # Nothing but arrangement words, or blank. Before calling it
         # unrestricted, fall back to the board's own market.
         home = SOURCE_DEFAULT_REGION.get(job.get("source", ""))
-        if home and not _any(home.lower(), NZ_REACHABLE_REGIONS):
+        if home and not _any(home.lower(), market["reachable_remote"]):
             return False, (f"{job.get('source')} is a {home} board and this "
                            f"posting names no region - assuming {home}")
         return True, ""
 
-    return True, ""
+    # 4. Not in the market and not remote.
+    if market.get("require_remote"):
+        return False, f"not remote: {job.get('location') or '?'}"
+    return False, (f"not reachable for {market['label']}: "
+                   f"{job.get('location') or '?'}")
 
 
-def prefilter(job: dict, gate: str = "") -> dict:
+def prefilter(job: dict, market: "dict | str | None" = None) -> dict:
     """Score 0-100 on keywords alone. No LLM, fully explainable."""
     title = src_mod.fold(job["title"]).lower()
     loc   = src_mod.fold(job.get("location") or "").lower()
@@ -593,8 +795,10 @@ def prefilter(job: dict, gate: str = "") -> dict:
     if not _any(blob, REQUIRE_ANY):
         reject.append("no C/C++ signal")
 
-    if gate:
-        ok, why = _location_ok(job, gate)
+    if market is not None:
+        if isinstance(market, str):
+            market = resolve_market(market)
+        ok, why = _location_ok(job, market)
         if not ok:
             reject.append(why)
 
@@ -701,15 +905,26 @@ def gather_phase(phase: dict, cfg: dict, registry: list[dict],
                  log: Callable[[str], None],
                  registry_jobs: list[dict] | None = None,
                  tick: Callable[[str, int, int], None] | None = None,
+                 market: dict | None = None,
                  ) -> list[dict]:
     """Fetch every source a phase asks for. Never raises for one bad source.
 
     registry_jobs lets the caller poll the company registry once and share it
     across phases - the ATS results are identical either way, and every phase
     re-polling them is pure duplicate traffic.
+
+    market supplies the Seek `where` value and, for a phase that leaves a
+    source list unset, its default sources.
     """
     jobs: list[dict] = []
-    gate = phase.get("gate", "")
+    market = market or {}
+    where  = market.get("where", "") or ""
+    seek_sites = phase.get("seek_sites")
+    if seek_sites is None:
+        seek_sites = market.get("seek_sites", [])
+    aggs = phase.get("aggregators")
+    if aggs is None:
+        aggs = market.get("aggregators", [])
     # Seek and Indeed can filter by age server-side, which saves paging through
     # stale results; every other source is filtered on the way out below.
     max_age = int(cfg.get("max_age_days", 0) or 0)
@@ -728,7 +943,7 @@ def gather_phase(phase: dict, cfg: dict, registry: list[dict],
         log(f"  registry: {len(got)}")
         jobs.extend(got)
 
-    for site in phase.get("seek_sites", []):
+    for site in seek_sites:
         # Collect every keyword's hits first and de-duplicate by posting id
         # before hydrating. Keywords overlap heavily - a senior C++ embedded
         # role matches four of them - and hydration is one HTTP call per
@@ -741,7 +956,8 @@ def gather_phase(phase: dict, cfg: dict, registry: list[dict],
             step(f"Searching Seek for \"{kw}\"", n - 1, len(kws))
             try:
                 stubs = src_mod.seek_search(
-                    kw, site=site, max_jobs=phase.get("max_jobs", 300),
+                    kw, site=site, where=where,
+                    max_jobs=phase.get("max_jobs", 300),
                     date_range=max_age or 31)
             except Exception as exc:                             # noqa: BLE001
                 log(f"  seek-{site} '{kw}': failed ({exc})")
@@ -773,7 +989,6 @@ def gather_phase(phase: dict, cfg: dict, registry: list[dict],
                     f"Reading job descriptions from Seek", d, t))
         jobs.extend(todo)
 
-    aggs = phase.get("aggregators", [])
     if aggs:
         done = [0]
 
@@ -787,7 +1002,9 @@ def gather_phase(phase: dict, cfg: dict, registry: list[dict],
         log(f"  aggregators: {len(got)}")
         jobs.extend(got)
 
-    profiles = phase.get("browser_profiles", [])
+    profiles = phase.get("browser_profiles")
+    if profiles is None:
+        profiles = market.get("browser_profiles", [])
     if profiles:
         try:
             from . import render                                 # noqa: PLC0415
@@ -831,7 +1048,7 @@ def gather_phase(phase: dict, cfg: dict, registry: list[dict],
     jobs = filter_by_age(jobs, max_age, log)
 
     for j in jobs:
-        j.setdefault("phase", phase.get("name", gate))
+        j.setdefault("phase", phase.get("name", market.get("label", "")))
     return jobs
 
 
@@ -951,8 +1168,13 @@ def run_scan(prefilter_min: float | None = None, limit: int | None = None,
              do_llm: bool = True, do_rank: bool = True,
              include_seen: bool = True, since_days: int | None = None,
              progress: Callable[[str, int, int], None] | None = None,
+             market: str | None = None,
              ) -> dict:
     """Full scan across every enabled phase, persisted to disk.
+
+    market, when given, replaces the configured phases with a single on-demand
+    phase for that market (see MARKETS) - this is how "scan Germany now" works
+    without editing the saved configuration. An unknown name raises ValueError.
 
     include_seen defaults to True: a posting you have not acted on is still a
     live opportunity, and hiding it was what made rescans look empty. Dismissed
@@ -989,7 +1211,25 @@ def run_scan(prefilter_min: float | None = None, limit: int | None = None,
     seen     = state["seen"]
     hidden   = set(state["dismissed"]) | set(state["applied"])
 
-    phases = [p for p in cfg.get("phases", []) if p.get("enabled", True)]
+    forced_market: dict | None = None
+    if market:
+        forced_market = resolve_market(market, cfg)     # raises on a typo
+        phases = [_synthetic_phase(market.strip().lower(), forced_market, cfg)]
+        log(f"market override: scanning {forced_market['label']} only")
+    else:
+        phases = [p for p in cfg.get("phases", []) if p.get("enabled", True)]
+
+    # Resolve each phase's market up front so a bad name is reported before any
+    # network traffic, and the same object is reused for gather + prefilter.
+    phase_markets: list[dict | None] = []
+    for p in phases:
+        try:
+            phase_markets.append(forced_market or resolve_market(p, cfg))
+        except ValueError as exc:
+            log(f"  !! {exc} - phase {p.get('name', '?')!r} will not gate on "
+                f"location")
+            phase_markets.append(None)
+
     all_jobs: list[dict] = []
     survivors: list[dict] = []
     rejected = 0
@@ -1011,18 +1251,19 @@ def run_scan(prefilter_min: float | None = None, limit: int | None = None,
         log(f"registry: {len(registry_jobs)} postings from "
             f"{len(registry)} companies")
 
-    for idx, phase in enumerate(phases, 1):
+    for idx, (phase, mkt) in enumerate(zip(phases, phase_markets), 1):
         name = phase.get("name", f"phase {idx}")
         tick(f"{name}: starting", 0, 1)
-        log(f"\n[{idx}/{len(phases)}] {name}")
+        log(f"\n[{idx}/{len(phases)}] {name}"
+            + (f"  (market: {mkt['label']})" if mkt else ""))
 
-        raw = gather_phase(phase, cfg, registry, log, registry_jobs, tick)
+        raw = gather_phase(phase, cfg, registry, log, registry_jobs, tick, mkt)
         raw = [j for j in raw if j["id"] not in hidden]
         all_jobs.extend(raw)
 
         kept = []
         for j in raw:
-            j.update(prefilter(j, phase.get("gate", "")))
+            j.update(prefilter(j, mkt))
             if j["reject"]:
                 rejected += 1
                 continue
@@ -1178,6 +1419,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="max postings sent to the LLM stage")
     ap.add_argument("--phase", default="",
                     help="run only the phase whose name contains this")
+    ap.add_argument("--market", default="",
+                    help="scan one market on demand instead of the configured "
+                         "phases: " + ", ".join(sorted(MARKETS)))
+    ap.add_argument("--list-markets", action="store_true",
+                    help="print the known markets and exit")
     ap.add_argument("--since-days", type=int, default=None, metavar="N",
                     help="only postings from the last N days (0 = no limit)")
     ap.add_argument("--fresh", action="store_true",
@@ -1210,6 +1456,16 @@ def main(argv: list[str] | None = None) -> int:
                   file=sys.stderr)
         return 0
 
+    if args.list_markets:
+        cfg = load_config()
+        for name in sorted(set(MARKETS) | set(cfg.get("markets") or {})):
+            m = resolve_market(name, cfg)
+            sites = ",".join(m.get("seek_sites") or []) or "-"
+            print(f"  {name:<12} {m['label']:<20} "
+                  f"seek:{sites:<7} aggregators:{len(m.get('aggregators') or [])}"
+                  f"  remote-only:{'yes' if m.get('require_remote') else 'no'}")
+        return 0
+
     if args.validate:
         for s in load_sources():
             ok, n = src_mod.validate_source(s)
@@ -1218,15 +1474,20 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     cfg = load_config()
-    if args.phase:
+    if args.phase and not args.market:
         for p in cfg["phases"]:
             p["enabled"] = args.phase.lower() in p.get("name", "").lower()
         save_config(cfg)
 
     since = 1 if args.fresh else args.since_days
-    payload = run_scan(prefilter_min=args.prefilter_min, limit=args.limit,
-                       do_llm=not args.prefilter_only,
-                       do_rank=not args.no_rank, since_days=since)
+    try:
+        payload = run_scan(prefilter_min=args.prefilter_min, limit=args.limit,
+                           do_llm=not args.prefilter_only,
+                           do_rank=not args.no_rank, since_days=since,
+                           market=args.market or None)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     c = payload["counts"]
     print(f"\nfetched {c['fetched']}, rejected {c['rejected']}, "
