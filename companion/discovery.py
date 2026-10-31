@@ -9,8 +9,8 @@ fallback. Each phase decides its own sources and its own location gate, so
 "remote" means remote in the phase that wants it and is irrelevant in the one
 that does not.
 
-  phase 1  Germany       Arbeitnow + Indeed Germany + the company registry
-  phase 2  Remote        remote aggregators + the registry
+  phase 1  Berlin        Arbeitnow + Indeed Germany + the company registry
+  phase 2  Remote        Germany-reachable remote aggregators + the registry
 
 Each phase names a market (discovery.MARKETS) that supplies its location gate
 and its default sources. Markets are data, so scanning a different country is a
@@ -270,6 +270,20 @@ def _mk(label: str, *, where: str = "",
     }
 
 
+GERMANY_TERMS = (
+    "germany", "deutschland", "berlin", "munich", "munchen", "muenchen",
+    "hamburg", "frankfurt", "cologne", "koln", "koeln", "stuttgart",
+    "dusseldorf", "duesseldorf", "leipzig", "dortmund", "dresden", "hannover",
+    "hanover", "nuremberg", "nurnberg", "bremen", "karlsruhe", "mannheim",
+    "dach", "de")
+
+# Places a person living in Germany can work remotely for. German city names
+# are included because boards often tag a remote role with its office city.
+GERMANY_REACHABLE = (
+    "germany", "deutschland", "europe", "european union", "eu", "emea", "eea",
+    "cet", "cest", "central european", "dach", "remote europe",
+    "europe-based", "europe based") + GERMANY_TERMS
+
 MARKETS: dict[str, dict[str, Any]] = {
     "nz": _mk(
         "New Zealand", where="New Zealand", seek_sites=("nz",),
@@ -295,19 +309,30 @@ MARKETS: dict[str, dict[str, Any]] = {
         browser_profiles=("indeed-de",),
         aggregators=("arbeitnow", "remoteok", "remotive", "himalayas",
                      "workingnomads"),
-        in_market=("germany", "deutschland", "berlin", "munich", "munchen",
-                   "muenchen", "hamburg", "frankfurt", "cologne", "koln",
-                   "koeln", "stuttgart", "dusseldorf", "duesseldorf", "leipzig",
-                   "dortmund", "dresden", "hannover", "hanover", "nuremberg",
-                   "nurnberg", "bremen", "karlsruhe", "mannheim", "dach",
-                   "de"),
-        reachable_remote=("germany", "deutschland", "europe", "european union",
-                          "eu", "emea", "eea", "cet", "cest",
-                          "central european", "dach", "remote europe",
-                          "europe-based", "europe based"),
+        in_market=GERMANY_TERMS,
+        reachable_remote=GERMANY_REACHABLE,
         work_auth_block=_US_AUTH_BLOCK + (
             "right to work in the uk", "eligible to work in the uk",
             "must be a u.s. citizen", "must be a us citizen"),
+    ),
+    # The two default phases: on-site in Berlin, then remote from Germany.
+    "berlin": _mk(
+        "Berlin, Germany", where="Berlin, Germany",
+        browser_profiles=("indeed-de",),
+        aggregators=("arbeitnow",),
+        in_market=("berlin",),
+        reachable_remote=GERMANY_REACHABLE,
+        work_auth_block=_US_AUTH_BLOCK + (
+            "right to work in the uk", "eligible to work in the uk"),
+    ),
+    "germany-remote": _mk(
+        "Germany (remote)", where="Germany",
+        aggregators=("arbeitnow", "remotive", "himalayas", "workingnomads",
+                     "remoteok", "jobicy"),
+        reachable_remote=GERMANY_REACHABLE,
+        work_auth_block=_US_AUTH_BLOCK + (
+            "right to work in the uk", "eligible to work in the uk"),
+        require_remote=True,
     ),
     "uk": _mk(
         "United Kingdom",
@@ -333,10 +358,7 @@ MARKETS: dict[str, dict[str, Any]] = {
     "remote": _mk(
         "Remote worldwide",
         in_market=(),
-        reachable_remote=("germany", "deutschland", "europe", "european union",
-                          "eu", "emea", "eea", "cet", "cest",
-                          "central european", "dach", "remote europe",
-                          "europe-based", "europe based"),
+        reachable_remote=GERMANY_REACHABLE,
         work_auth_block=WORK_AUTH_BLOCK,
         require_remote=True,
     ),
@@ -486,9 +508,9 @@ DEFAULT_SOURCES: list[dict[str, str]] = [
 DEFAULT_CONFIG: dict[str, Any] = {
     "phases": [
         {
-            "name": "Germany",
+            "name": "Berlin, Germany",
             "enabled": True,
-            "market": "germany",
+            "market": "berlin",
             # Searching "c++" alone is too narrow: boards tokenise the plus
             # signs unpredictably and plenty of matching roles never put it in
             # the title. Cast wide on job titles and let the prefilter enforce
@@ -509,9 +531,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "max_jobs": 400,
         },
         {
-            "name": "Remote worldwide",
+            "name": "Germany (remote)",
             "enabled": True,
-            "market": "remote",
+            "market": "germany-remote",
             "keywords": ["c++", "senior software engineer"],
             "seek_sites": [],
             "aggregators": ["arbeitnow", "remoteok", "remotive", "jobicy",

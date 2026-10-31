@@ -2164,6 +2164,8 @@ function renderPhases(){
         <b style="color:var(--text)">${p.name}</b>
         <span class="meta">&nbsp;${
           (m => m === 'nz' ? 'keeps only jobs you could do from New Zealand'
+             : m === 'berlin' ? 'keeps only jobs located in Berlin (plus remote from Germany)'
+             : m === 'germany-remote' ? 'keeps only remote jobs you could do from Germany'
              : m === 'germany' ? 'keeps only jobs you could do from Germany'
              : m === 'remote' ? 'keeps only fully remote jobs'
              : m ? ('location filter: ' + m)
