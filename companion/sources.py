@@ -442,14 +442,21 @@ def seek_hydrate(jobs: list[dict], *, site: str = "nz",
 # ══════════════════════════════════════════════════════════════════════════════
 
 def agg_arbeitnow() -> list[dict]:
-    d = http_json("https://www.arbeitnow.com/api/job-board-api")
+    rows: list[dict] = []
+    # 300 postings a page, newest first; three pages reaches well past a week.
+    for page in (1, 2, 3):
+        d = http_json(f"https://www.arbeitnow.com/api/job-board-api?page={page}")
+        got = (d or {}).get("data") or []
+        if not got:
+            break
+        rows.extend(got)
     return [_job(
         id=f"arbeitnow:{j.get('slug')}", source="arbeitnow",
         company=j.get("company_name", ""), title=(j.get("title") or "").strip(),
         location=j.get("location", ""), url=j.get("url", ""),
         posted=str(j.get("created_at", "")), remote=bool(j.get("remote")),
         description=strip_html(j.get("description", "")),
-    ) for j in (d or {}).get("data", [])]
+    ) for j in rows]
 
 
 def agg_remoteok() -> list[dict]:

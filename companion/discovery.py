@@ -9,7 +9,7 @@ fallback. Each phase decides its own sources and its own location gate, so
 "remote" means remote in the phase that wants it and is irrelevant in the one
 that does not.
 
-  phase 1  New Zealand   Seek NZ + the company registry
+  phase 1  Germany       Arbeitnow + Indeed Germany + the company registry
   phase 2  Remote        remote aggregators + the registry
 
 Each phase names a market (discovery.MARKETS) that supplies its location gate
@@ -182,9 +182,8 @@ NZ_REACHABLE_REGIONS = (
 # through the location gate until this was added. Language markers in the title
 # ("(m/w/d)", "(m/f/d)") corroborate it.
 #
-# Germany is a real future market for him - job_target_list.md plans a 2028
-# return - but not one he can work in now, so it is a reject with a reason
-# rather than a silent drop.
+# Germany is now the default market, so these postings pass the gate; the
+# default region only rejects them for other markets (e.g. a NZ or UK scan).
 SOURCE_DEFAULT_REGION = {
     "arbeitnow": "Germany",
 }
@@ -293,6 +292,7 @@ MARKETS: dict[str, dict[str, Any]] = {
     ),
     "germany": _mk(
         "Germany", where="Germany",
+        browser_profiles=("indeed-de",),
         aggregators=("arbeitnow", "remoteok", "remotive", "himalayas",
                      "workingnomads"),
         in_market=("germany", "deutschland", "berlin", "munich", "munchen",
@@ -333,7 +333,10 @@ MARKETS: dict[str, dict[str, Any]] = {
     "remote": _mk(
         "Remote worldwide",
         in_market=(),
-        reachable_remote=tuple(NZ_REACHABLE_REGIONS),
+        reachable_remote=("germany", "deutschland", "europe", "european union",
+                          "eu", "emea", "eea", "cet", "cest",
+                          "central european", "dach", "remote europe",
+                          "europe-based", "europe based"),
         work_auth_block=WORK_AUTH_BLOCK,
         require_remote=True,
     ),
@@ -455,11 +458,27 @@ PENALTIES: dict[str, int] = {
 # ══════════════════════════════════════════════════════════════════════════════
 
 DEFAULT_SOURCES: list[dict[str, str]] = [
-    {"ats": "greenhouse", "slug": "rocketlab",     "name": "Rocket Lab"},
-    {"ats": "greenhouse", "slug": "eqvilentjobs",  "name": "Eqvilent"},
     {"ats": "greenhouse", "slug": "imc",           "name": "IMC Trading"},
     {"ats": "greenhouse", "slug": "janestreet",    "name": "Jane Street"},
-    {"ats": "greenhouse", "slug": "dawnaerospace", "name": "Dawn Aerospace"},
+    # Germany-based employers (slugs verified live 2026-11-01).
+    {"ats": "greenhouse", "slug": "celonis", "name": "Celonis"},
+    {"ats": "greenhouse", "slug": "n26", "name": "N26"},
+    {"ats": "greenhouse", "slug": "getyourguide", "name": "GetYourGuide"},
+    {"ats": "greenhouse", "slug": "contentful", "name": "Contentful"},
+    {"ats": "greenhouse", "slug": "grover", "name": "Grover"},
+    {"ats": "greenhouse", "slug": "sumup", "name": "SumUp"},
+    {"ats": "greenhouse", "slug": "flix", "name": "FlixBus"},
+    {"ats": "greenhouse", "slug": "raisin", "name": "Raisin"},
+    {"ats": "greenhouse", "slug": "helsing", "name": "Helsing"},
+    {"ats": "greenhouse", "slug": "isaraerospace", "name": "Isar Aerospace"},
+    {"ats": "greenhouse", "slug": "trivago", "name": "trivago"},
+    {"ats": "ashby", "slug": "deepl", "name": "DeepL"},
+    {"ats": "ashby", "slug": "n8n", "name": "n8n"},
+    {"ats": "ashby", "slug": "parloa", "name": "Parloa"},
+    {"ats": "ashby", "slug": "langdock", "name": "Langdock"},
+    {"ats": "ashby", "slug": "black-forest-labs", "name": "Black Forest Labs"},
+    {"ats": "ashby", "slug": "tacto", "name": "Tacto"},
+    {"ats": "smartrecruiters", "slug": "BoschGroup", "name": "Bosch"},
 ]
 
 # Seek is queried per keyword, so keep the list short and high-signal - each
@@ -467,9 +486,9 @@ DEFAULT_SOURCES: list[dict[str, str]] = [
 DEFAULT_CONFIG: dict[str, Any] = {
     "phases": [
         {
-            "name": "New Zealand",
+            "name": "Germany",
             "enabled": True,
-            "market": "nz",
+            "market": "germany",
             # Searching "c++" alone is too narrow: boards tokenise the plus
             # signs unpredictably and plenty of matching roles never put it in
             # the title. Cast wide on job titles and let the prefilter enforce
@@ -478,12 +497,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "keywords": ["senior software engineer", "senior software developer",
                          "c++", "c# .net", "python developer",
                          "embedded software", "firmware"],
-            "seek_sites": ["nz"],
-            "aggregators": [],
+            # Seek does not operate in Germany; Arbeitnow is the German board.
+            "seek_sites": [],
+            "aggregators": ["arbeitnow"],
             # Indeed needs a headed, signed-in browser (page 2+ is gated behind
             # login), which the render layer handles. Seek is deliberately not
             # here: it server-renders and its JSON API returns more, faster.
-            "browser_profiles": ["indeed-nz"],
+            "browser_profiles": ["indeed-de"],
             "browser_pages": 6,
             "use_registry": True,
             "max_jobs": 400,

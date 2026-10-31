@@ -289,7 +289,7 @@ def _populate_profile_from_resume() -> None:
         "- work_authorization: only include if the resume explicitly states citizenship, "
         "visa status, or right-to-work (e.g. 'Open Work Visa', 'PR', 'requires sponsorship'). "
         "Never assume citizenship from a name or location.\n"
-        "- location: city/country only if stated (e.g. 'Auckland, New Zealand').\n"
+        "- location: city/country only if stated (e.g. 'Berlin, Germany').\n"
         "- Do not include any explanation — JSON only."
     )
     try:
@@ -2164,12 +2164,13 @@ function renderPhases(){
         <b style="color:var(--text)">${p.name}</b>
         <span class="meta">&nbsp;${
           (m => m === 'nz' ? 'keeps only jobs you could do from New Zealand'
+             : m === 'germany' ? 'keeps only jobs you could do from Germany'
              : m === 'remote' ? 'keeps only fully remote jobs'
              : m ? ('location filter: ' + m)
              : 'keeps everything')(p.market || p.gate)}${
           (p.browser_profiles||[]).length
             ? ' · opens a browser for ' + p.browser_profiles
-                .map(s => s.replace('-nz','').replace(/^./, m => m.toUpperCase()))
+                .map(s => s.replace(/-(nz|de)$/,'').replace(/^./, m => m.toUpperCase()))
                 .join(', ')
             : ''}</span>
       </label>

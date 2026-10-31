@@ -78,8 +78,8 @@ def why_unavailable() -> str:
 # diversity: each presents its own TLS fingerprint, JS engine and viewport
 # rather than every request looking like the same headless Chrome. Rotation is
 # per site, because the engine is fixed at browser launch.
-_LOCALE = "en-NZ"
-_TZ = "Pacific/Auckland"
+_LOCALE = "de-DE"
+_TZ = "Europe/Berlin"
 
 ENGINES = ("chromium", "firefox", "webkit")
 DEVICES = ("desktop", "mobile")
@@ -758,6 +758,56 @@ SITE_PROFILES: dict[str, dict] = {
                 "`render.py --login indeed-nz` once. Reads the DOM - there is "
                 "no usable JSON to intercept.",
     },
+    "indeed-de": {
+        "label": "Indeed Germany",
+        "url": lambda kw, page: (
+            f"https://de.indeed.com/jobs?q={kw.replace(' ', '+')}"
+            f"&start={(page - 1) * 10}"),
+        # Indeed only honours fromage=1/3/7/14; anything else is ignored
+        # silently and you get the unfiltered list back, so round up to the
+        # nearest bucket it accepts rather than passing the raw request.
+        "fresh_param": lambda days: "fromage={}".format(
+            min((d for d in (1, 3, 7, 14) if d >= days), default=14)),
+        # Modelled on indeed-nz (same Indeed front end, not yet verified on de.indeed.com): plain HTTP gets a hard 403 on the first
+        # request, but landing on the homepage and typing the query returns 506
+        # responses with no 403 at all and 16 result cards per page.
+        "warmup": "https://de.indeed.com",
+        "search_selector": "input#text-input-what, input[name=q]",
+        "requires_headed": True,
+        # Pinned: the signed-in session lives in the chromium profile.
+        "engine": "chromium",
+        "settle": 6.0,
+        "scroll_passes": 3,
+        "dom": {
+            "card": [".job_seen_beacon", "td.resultContent", ".cardOutline",
+                     "#mosaic-provider-jobcards li"],
+            "fields": {
+                "title": ["h2 span[title]", "span[id^=jobTitle-]",
+                          "h2.jobTitle", ".jobTitle"],
+                "company": ["[data-testid=company-name]", ".companyName"],
+                "location": ["[data-testid=text-location]",
+                             ".companyLocation"],
+                "salary": ["[data-testid=attribute_snippet_testid]",
+                           ".salary-snippet-container", ".metadata.salary"],
+                "posted": ["[data-testid=myJobsStateDate]",
+                           "[data-testid=timing-attribute]", ".date"],
+                "description": ["[data-testid=belowJobSnippet]",
+                                ".job-snippet", "ul"],
+            },
+            "id_from": {"sel": "a[href*='jk=']", "attr": "href",
+                        "regex": r"jk=([0-9a-f]+)"},
+        },
+        "url_tpl": "https://de.indeed.com/viewjob?jk={ext_id}",
+        "next_selectors": ("a[data-testid='pagination-page-next']",
+                           "a[aria-label='Next Page']"),
+        "note": "Requires headed mode AND a signed-in session. Headless "
+                "returns 0 cards where headed returns 16, so Indeed detects "
+                "headless Chrome; and clicking to page 2 redirects to "
+                "secure.indeed.com/auth with 'To see more than one page of "
+                "jobs, create an account or sign in'. Run "
+                "`render.py --login indeed-de` once. Reads the DOM - there is "
+                "no usable JSON to intercept.",
+    },
 }
 
 
@@ -967,6 +1017,7 @@ def fetch_profiles(names: Iterable[str], keywords: str, *,
 
 LOGIN_URLS = {
     "indeed-nz": "https://nz.indeed.com/account/login",
+    "indeed-de": "https://de.indeed.com/account/login",
     "seek-nz":   "https://www.seek.co.nz/oauth/login/",
     "zeil":      "https://www.zeil.com/login",
 }

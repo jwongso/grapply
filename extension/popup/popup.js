@@ -847,7 +847,7 @@ function DiscoveryPanel({ settings, health }) {
 
       ${!running && jobs.length === 0 && !error && html`
         <div class="disc-empty">
-          No results yet. Explore sweeps NZ first, then remote worldwide.
+          No results yet. Explore sweeps Germany first, then remote worldwide.
         </div>`}
 
       ${data?.generated && html`

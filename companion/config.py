@@ -80,10 +80,10 @@ DEFAULTS: dict[str, Any] = {
         "linkedin":           "",  # e.g. https://linkedin.com/in/yourname
         "github":             "",  # e.g. https://github.com/yourname
         "website":            "",  # personal portfolio / homepage
-        "location":           "",  # e.g. Auckland, New Zealand
-        "work_authorization": "",  # e.g. "NZ citizen", "yes", "requires visa sponsorship"
+        "location":           "",  # e.g. Berlin, Germany
+        "work_authorization": "",  # e.g. "EU citizen", "yes", "requires visa sponsorship"
         "availability":       "",  # e.g. "2 weeks notice", "immediately"
-        "salary_expectation": "",  # e.g. "$120,000 NZD"
+        "salary_expectation": "",  # e.g. "EUR 80,000"
     },
 }
 
@@ -148,8 +148,8 @@ phone              = ""
 linkedin           = ""   # e.g. https://linkedin.com/in/yourname
 github             = ""
 website            = ""
-location           = ""   # e.g. Auckland, New Zealand
-work_authorization = ""   # e.g. NZ citizen / requires visa sponsorship
+location           = ""   # e.g. Berlin, Germany
+work_authorization = ""   # e.g. EU citizen / requires visa sponsorship
 availability       = ""   # e.g. 2 weeks notice
 salary_expectation = ""
 """
