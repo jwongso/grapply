@@ -63,6 +63,9 @@ CONFIG_PATH  = Path("~/.grapply/discovery_config.json").expanduser()
 TITLE_REJECT = (
     "intern", "internship", "graduate", "new grad", "junior", "trainee",
     "apprentice", "student", "placement", "co-op", "co op",
+    # German and Dutch boards post these in their own language.
+    "praktikum*", "praktikant*", "werkstudent*", "ausbildung*", "azubi*",
+    "berufseinsteiger*", "duales studium", "stage", "stagiaire",
 )
 
 # The NZ market is far too small to gate on C++ alone - that rejected roughly
@@ -75,10 +78,18 @@ REQUIRE_ANY = ("c++", "cpp", "c/c++", "c#", "csharp", ".net", "dotnet",
 
 # A JD body mentioning C++ is not enough - quant firms name it in trader and
 # analyst postings too. The title has to describe an engineering role.
+GERMAN_DEV_TITLES = (
+    "entwickler*", "softwareentwickler*", "softwareingenieur*",
+    "softwarearchitekt*", "informatiker*", "fachinformatiker*",
+    "programmierer*", "webentwickler*", "anwendungsentwickler*",
+    "applikationsentwickler*", "firmwareentwickler*", "backendentwickler*",
+    "frontendentwickler*", "fullstackentwickler*", "embeddedentwickler*",
+)
+
 TITLE_REQUIRE_ANY = (
     "engineer", "developer", "programmer", "software", "architect",
     "sre", "devops", "lead", "leader",
-)
+) + GERMAN_DEV_TITLES
 
 # Some postings carry a senior-sounding title but open with "Junior ...".
 BODY_LEVEL_REJECT = (
@@ -109,7 +120,7 @@ SOFTWARE_TITLE_TERMS = (
     "backend", "back-end", "frontend", "front-end", "full stack",
     "full-stack", "devops", "sre", "platform", "application", "web",
     "cloud", "data engineer", "machine learning", "ml engineer",
-)
+) + GERMAN_DEV_TITLES
 
 # Trailing "*" marks a prefix, which most of these need - titles pluralise
 # ("Thermofluids Analysis", "Senior Vibrations Engineer") and a whole-word
@@ -225,6 +236,7 @@ WORK_AUTH_BLOCK = (
 DEFAULT_KEYWORDS: list[str] = [
     "senior software engineer", "senior software developer", "c++",
     "c# .net", "python developer", "embedded software", "firmware",
+    "softwareentwickler",
 ]
 
 # A JD that plainly says work-from-anywhere clears the gate for every market,
@@ -253,10 +265,12 @@ def _mk(label: str, *, where: str = "",
         in_market: tuple[str, ...] = (),
         reachable_remote: tuple[str, ...] = (),
         work_auth_block: tuple[str, ...] = (),
-        require_remote: bool = False) -> dict[str, Any]:
+        require_remote: bool = False,
+        linkedin: bool = False) -> dict[str, Any]:
     return {
         "label": label,
         "where": where,
+        "linkedin": linkedin,
         "seek_sites": list(seek_sites),
         "browser_profiles": list(browser_profiles),
         "aggregators": list(aggregators),
@@ -275,7 +289,7 @@ GERMANY_TERMS = (
     "hamburg", "frankfurt", "cologne", "koln", "koeln", "stuttgart",
     "dusseldorf", "duesseldorf", "leipzig", "dortmund", "dresden", "hannover",
     "hanover", "nuremberg", "nurnberg", "bremen", "karlsruhe", "mannheim",
-    "dach", "de")
+    "dach")
 
 # Places a person living in Germany can work remotely for. German city names
 # are included because boards often tag a remote role with its office city.
@@ -317,7 +331,7 @@ MARKETS: dict[str, dict[str, Any]] = {
     ),
     # The two default phases: on-site in Berlin, then remote from Germany.
     "berlin": _mk(
-        "Berlin, Germany", where="Berlin, Germany",
+        "Berlin, Germany", where="Berlin, Germany", linkedin=True,
         browser_profiles=("indeed-de",),
         aggregators=("arbeitnow",),
         in_market=("berlin",),
@@ -326,7 +340,7 @@ MARKETS: dict[str, dict[str, Any]] = {
             "right to work in the uk", "eligible to work in the uk"),
     ),
     "germany-remote": _mk(
-        "Germany (remote)", where="Germany",
+        "Germany (remote)", where="Germany", linkedin=True,
         aggregators=("arbeitnow", "remotive", "himalayas", "workingnomads",
                      "remoteok", "jobicy"),
         reachable_remote=GERMANY_REACHABLE,
@@ -407,6 +421,7 @@ def _synthetic_phase(name: str, market: dict, cfg: dict) -> dict:
         "keywords": list(cfg.get("default_keywords") or DEFAULT_KEYWORDS),
         "seek_sites": list(market.get("seek_sites", [])),
         "aggregators": list(market.get("aggregators", [])),
+        "linkedin": bool(market.get("linkedin")),
         "browser_profiles": list(market.get("browser_profiles", [])),
         "browser_pages": 6,
         "browser_keywords": 1,
@@ -518,7 +533,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
             # precision is unchanged because the gate is downstream.
             "keywords": ["senior software engineer", "senior software developer",
                          "c++", "c# .net", "python developer",
-                         "embedded software", "firmware"],
+                         "embedded software", "firmware", "softwareentwickler"],
+            # LinkedIn's public guest search, no login. Berlin has far more
+            # roles there than on Arbeitnow or in the company registry.
+            "linkedin": True,
             # Seek does not operate in Germany; Arbeitnow is the German board.
             "seek_sites": [],
             "aggregators": ["arbeitnow"],
@@ -534,7 +552,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "name": "Germany (remote)",
             "enabled": True,
             "market": "germany-remote",
-            "keywords": ["c++", "senior software engineer"],
+            "keywords": ["c++", "senior software engineer", "softwareentwickler"],
+            "linkedin": True,
             "seek_sites": [],
             "aggregators": ["arbeitnow", "remoteok", "remotive", "jobicy",
                             "workingnomads", "himalayas"],
@@ -770,19 +789,23 @@ def _location_ok(job: dict, market: dict | None) -> tuple[bool, str]:
         return False, f"needs work rights not held ('{auth}')"
 
     # 3. Remote - but remote from where?
-    if is_remote or _any(body[:1500], REMOTE_TERMS):
+    #    Strip the arrangement words. Whatever survives is a place.
+    residue = loc
+    for term in REMOTE_GENERIC:
+        residue = residue.replace(term, " ")
+    residue = re.sub(r"[^a-z0-9]+", " ", residue).strip()
+    # A JD that merely mentions remote work ("hybrid", "remote-friendly") does
+    # not make a role with a named office remote: "Amsterdam office" stays an
+    # Amsterdam job. The body only decides when the location names no place.
+    if is_remote or (not residue and _any(body[:1500], REMOTE_TERMS)):
         if _any(loc, market["reachable_remote"]):
             return True, ""
         # A JD that plainly says work-from-anywhere, HQ city notwithstanding.
         if _any(body[:900], _REMOTE_ANYWHERE):
             return True, ""
-        # Strip the arrangement words. Whatever survives is a place, and since
-        # it did not match the reachable list, it is a place he cannot work
-        # from. Rejecting unknown regions by default beats enumerating Earth.
-        residue = loc
-        for term in REMOTE_GENERIC:
-            residue = residue.replace(term, " ")
-        residue = re.sub(r"[^a-z0-9]+", " ", residue).strip()
+        # Whatever survives did not match the reachable list, so it is a place
+        # he cannot work from. Rejecting unknown regions by default beats
+        # enumerating Earth.
         if residue:
             return False, (f"remote but region-locked: "
                            f"{job.get('location') or '?'}")
@@ -967,6 +990,9 @@ def gather_phase(phase: dict, cfg: dict, registry: list[dict],
     aggs = phase.get("aggregators")
     if aggs is None:
         aggs = market.get("aggregators", [])
+    use_linkedin = phase.get("linkedin")
+    if use_linkedin is None:
+        use_linkedin = market.get("linkedin", False)
     # Seek and Indeed can filter by age server-side, which saves paging through
     # stale results; every other source is filtered on the way out below.
     max_age = int(cfg.get("max_age_days", 0) or 0)
@@ -1029,6 +1055,36 @@ def gather_phase(phase: dict, cfg: dict, registry: list[dict],
                 todo, site=site,
                 progress=lambda d, t: step(
                     f"Reading job descriptions from Seek", d, t))
+        jobs.extend(todo)
+
+    if use_linkedin:
+        # Same shape as Seek: search every keyword, de-duplicate, triage on the
+        # title, and only then pay for one detail request per survivor.
+        seen_li: set[str] = set()
+        fresh_li: list[dict] = []
+        kws = phase.get("keywords", [])
+        for n, kw in enumerate(kws, 1):
+            step(f"Searching LinkedIn for \"{kw}\"", n - 1, len(kws))
+            try:
+                stubs = src_mod.linkedin_search(
+                    kw, where=where, remote=bool(market.get("require_remote")),
+                    days=max_age, max_jobs=phase.get("linkedin_max", 100),
+                    max_pages=phase.get("linkedin_pages", 4))
+            except Exception as exc:                             # noqa: BLE001
+                log(f"  linkedin '{kw}': failed ({exc})")
+                continue
+            keep = [j for j in stubs if triage_title(j)]
+            new = [j for j in keep if j["id"] not in seen_li]
+            seen_li.update(j["id"] for j in new)
+            log(f"  linkedin '{kw}': {len(stubs)} found, "
+                f"{len(keep)} past triage, {len(new)} new")
+            fresh_li.extend(new)
+        todo = fresh_li[: phase.get("linkedin_hydrate", 150)]
+        if todo:
+            log(f"  linkedin: reading {len(todo)} job descriptions")
+            todo = src_mod.linkedin_hydrate(
+                todo, progress=lambda d, t: step(
+                    "Reading job descriptions from LinkedIn", d, t))
         jobs.extend(todo)
 
     if aggs:

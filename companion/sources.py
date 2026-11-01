@@ -438,6 +438,86 @@ def seek_hydrate(jobs: list[dict], *, site: str = "nz",
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# LinkedIn - public guest search, no login. Search is cheap, detail is not.
+# ══════════════════════════════════════════════════════════════════════════════
+# LinkedIn's terms prohibit automated access, so this is deliberately gentle:
+# a pause between every request, a few pages per keyword, and it stops at the
+# first 429 instead of retrying. Treat it as a personal job-hunt convenience.
+
+_LI_GUEST = "https://www.linkedin.com/jobs-guest/jobs/api"
+_LI_PAUSE = 1.2
+_LI_CARD = re.compile(
+    r'data-entity-urn="urn:li:jobPosting:(\d+)".*?'
+    r'base-search-card__title">\s*(.*?)\s*</h3>.*?'
+    r'base-search-card__subtitle">.*?(?:<a[^>]*>)?\s*([^<]+?)\s*(?:</a>)?\s*</h4>.*?'
+    r'job-search-card__location">\s*(.*?)\s*</span>'
+    r'(?:.*?<time[^>]*datetime="([^"]*)")?', re.S)
+
+
+def linkedin_search(keywords: str, *, where: str = "", remote: bool = False,
+                    days: int = 0, max_jobs: int = 100,
+                    max_pages: int = 4) -> list[dict]:
+    """Search LinkedIn's guest endpoint. Returns stubs with no description -
+    call linkedin_hydrate() on the ones that survive triage."""
+    out: list[dict] = []
+    seen: set[str] = set()
+    for page in range(max_pages):
+        # Guest pages hold 10 cards, not 25, so a fixed stride skips results.
+        params = {"keywords": keywords, "location": where, "start": len(seen)}
+        if days:
+            params["f_TPR"] = f"r{int(days) * 86400}"
+        if remote:
+            params["f_WT"] = "2"
+        url = f"{_LI_GUEST}/seeMoreJobPostings/search?" + \
+              urllib.parse.urlencode(params)
+        try:
+            html = http_text(url)
+        except Exception:                                        # noqa: BLE001
+            break
+        if not html:
+            break
+        got = 0
+        for m in _LI_CARD.finditer(html):
+            jid, title, company, loc, posted = m.groups()
+            if jid in seen:
+                continue
+            seen.add(jid)
+            got += 1
+            out.append(_job(
+                id=f"linkedin:{jid}", source="linkedin",
+                company=strip_html(company or ""),
+                title=strip_html(title or ""),
+                location=strip_html(loc or "") or where,
+                url=f"https://www.linkedin.com/jobs/view/{jid}",
+                posted=posted or "", remote=True if remote else None,
+            ))
+        if not got or len(out) >= max_jobs:
+            break
+        time.sleep(_LI_PAUSE)
+    return out[:max_jobs]
+
+
+def linkedin_hydrate(jobs: list[dict],
+                     progress: Callable[[int, int], None] | None = None,
+                     ) -> list[dict]:
+    """Fill in the real JD, one request per posting, sequentially and slowly."""
+    for i, job in enumerate(jobs, 1):
+        jid = job["id"].rsplit(":", 1)[-1]
+        try:
+            html = http_text(f"{_LI_GUEST}/jobPosting/{jid}")
+        except Exception:                                        # noqa: BLE001
+            html = ""
+        m = re.search(r'show-more-less-html__markup[^>]*>(.*?)</div>',
+                      html or "", re.S)
+        if m:
+            job["description"] = strip_html(m.group(1))
+        if progress:
+            progress(i, len(jobs))
+        time.sleep(_LI_PAUSE)
+    return jobs
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Remote aggregators - no slug needed, worldwide, descriptions inline
 # ══════════════════════════════════════════════════════════════════════════════
 
