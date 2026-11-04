@@ -294,7 +294,8 @@ WORK_AUTH_BLOCK = (
 # `"market": "<name>"`; the legacy `"gate"` key is still honoured as an alias.
 
 DEFAULT_KEYWORDS: list[str] = [
-    "senior software engineer", "senior software developer", "c++",
+    "senior software engineer", "senior software developer",
+    "staff software engineer", "principal software engineer", "c++",
     "embedded software", "firmware", "softwareentwickler",
 ]
 
@@ -619,6 +620,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             # the C++ requirement against the full JD - recall goes up, and
             # precision is unchanged because the gate is downstream.
             "keywords": ["senior software engineer", "senior software developer",
+                         "staff software engineer", "principal software engineer",
                          "c++", "embedded software", "firmware",
                          "softwareentwickler"],
             # LinkedIn's public guest search, no login. Berlin has far more
@@ -639,7 +641,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "name": "Germany (remote)",
             "enabled": True,
             "market": "germany-remote",
-            "keywords": ["c++", "senior software engineer"],
+            "keywords": ["c++", "senior software engineer",
+                         "staff software engineer", "principal software engineer"],
             "seek_sites": [],
             "aggregators": ["arbeitnow", "remoteok", "remotive", "jobicy",
                             "workingnomads", "himalayas"],
