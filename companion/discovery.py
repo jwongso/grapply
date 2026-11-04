@@ -235,8 +235,7 @@ WORK_AUTH_BLOCK = (
 
 DEFAULT_KEYWORDS: list[str] = [
     "senior software engineer", "senior software developer", "c++",
-    "c# .net", "python developer", "embedded software", "firmware",
-    "softwareentwickler",
+    "embedded software", "firmware", "softwareentwickler",
 ]
 
 # A JD that plainly says work-from-anywhere clears the gate for every market,
@@ -557,8 +556,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
             # the C++ requirement against the full JD - recall goes up, and
             # precision is unchanged because the gate is downstream.
             "keywords": ["senior software engineer", "senior software developer",
-                         "c++", "c# .net", "python developer",
-                         "embedded software", "firmware", "softwareentwickler"],
+                         "c++", "embedded software", "firmware",
+                         "softwareentwickler"],
             # LinkedIn's public guest search, no login. Berlin has far more
             # roles there than on Arbeitnow or in the company registry.
             "linkedin": True,
