@@ -240,8 +240,11 @@ DEFAULT_KEYWORDS: list[str] = [
 
 # A JD that plainly says work-from-anywhere clears the gate for every market,
 # even when it also prints a head-office city.
-_REMOTE_ANYWHERE = ("worldwide", "world wide", "anywhere in the world",
-                    "from anywhere", "work from anywhere", "globally remote",
+# The bare word "worldwide" is deliberately not here: "customers worldwide" and
+# "offices worldwide" describe the company, not where the role can be done.
+_REMOTE_ANYWHERE = ("remote worldwide", "worldwide remote", "work worldwide",
+                    "anywhere in the world", "from anywhere",
+                    "work from anywhere", "globally remote",
                     "fully distributed")
 
 # Body-only evidence that a role is remote. "Some flexibility for remote work"
@@ -1252,13 +1255,17 @@ def rank_candidates(jobs: list[dict], verbose: bool = True) -> list[dict]:
     resume = config.load_resume_text(cfg)
     ai     = ai_module.AIClient(cfg["ai"])
 
+    # Short numeric ids. Board ids are long slugs ("arbeitnow:senior-...-berlin-
+    # 12345") that the model mangles when echoing them back, and a mangled id
+    # silently left the job unranked while its rank number was lost.
+    alias = {str(n): j for n, j in enumerate(jobs, 1)}
     rows = []
-    for j in jobs:
+    for n, j in enumerate(jobs, 1):
         llm = j.get("llm", {}) or {}
         matched = "; ".join(
             f"{k}:{','.join(v[:5])}" for k, v in (j.get("hits") or {}).items())
         rows.append(
-            f"id={j['id']}\n"
+            f"id={n}\n"
             f"  title={j['title']}\n"
             f"  company={j['company']}  location={j.get('location','')}\n"
             f"  matched={matched}\n"
@@ -1282,16 +1289,25 @@ def rank_candidates(jobs: list[dict], verbose: bool = True) -> list[dict]:
         return jobs
 
     by_id = {j["id"]: j for j in jobs}
+    placed: list[tuple[int, dict]] = []
     for row in order:
-        j = by_id.get(row.get("id", ""))
-        if j:
+        key = str(row.get("id", "")).strip()
+        j = alias.get(key) or by_id.get(key)
+        if j and "rank" not in j:
             j["rank"]    = row.get("rank")
             j["verdict"] = row.get("verdict", "")
             j["why"]     = row.get("why", "")
-    ranked   = sorted((j for j in jobs if j.get("rank")),
-                      key=lambda x: x["rank"])
-    unranked = [j for j in jobs if not j.get("rank")]
-    return ranked + unranked
+            placed.append((int(row.get("rank") or 10**6), j))
+    ranked = [j for _, j in sorted(placed, key=lambda x: x[0])]
+    # Anything the model skipped goes below the ranked ones, best fit first,
+    # rather than floating with no number.
+    rest = sorted((j for j in jobs if "rank" not in j),
+                  key=lambda x: -float(x.get("llm_score") or 0))
+    ordered = ranked + rest
+    # Renumber densely so the list always reads 1..N with no gaps.
+    for n, j in enumerate(ordered, 1):
+        j["rank"] = n
+    return ordered
 
 
 # ══════════════════════════════════════════════════════════════════════════════

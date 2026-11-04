@@ -309,3 +309,56 @@ def test_remote_phase_does_not_use_linkedin():
     phases = {p["market"]: p for p in D.DEFAULT_CONFIG["phases"]}
     assert not phases["germany-remote"].get("linkedin")
     assert phases["berlin"]["linkedin"]
+
+
+# ── ranking and the "customers worldwide" leak ──────────────────────────────
+
+def _fake_ai(reply):
+    class _Ai:
+        def __init__(self, cfg): pass
+        def generate(self, system, user, **kw):
+            _Ai.seen = user
+            return reply
+    class _Cfg:
+        @staticmethod
+        def load(): return {"ai": {}}
+        @staticmethod
+        def load_resume_text(cfg): return "resume"
+    return _Ai, _Cfg
+
+
+def _ranked_jobs():
+    return [_job(id=f"arbeitnow:very-long-slug-{n}-berlin-9999{n}", llm_score=8.0 + n / 10,
+                 title=f"Job {n}") for n in range(1, 5)]
+
+
+def test_rank_candidates_numbers_have_no_gaps_when_ids_are_mangled(monkeypatch):
+    jobs = _ranked_jobs()
+    # The model echoes ids 1 and 3 correctly and mangles the other two.
+    reply = json.dumps([
+        {"rank": 1, "id": "garbled-a", "verdict": "strong", "why": "x"},
+        {"rank": 2, "id": "1", "verdict": "strong", "why": "x"},
+        {"rank": 3, "id": "garbled-b", "verdict": "worth it", "why": "x"},
+        {"rank": 4, "id": "3", "verdict": "marginal", "why": "x"},
+    ])
+    ai, cfg = _fake_ai(reply)
+    monkeypatch.setattr(D, "_ai_bits", lambda: (type("M", (), {"AIClient": ai}), None, cfg))
+    out = D.rank_candidates(jobs, verbose=False)
+    assert [j["rank"] for j in out] == [1, 2, 3, 4]
+    assert [j["title"] for j in out[:2]] == ["Job 1", "Job 3"]
+    # the two the model lost still appear, best fit first, with real numbers
+    assert [j["title"] for j in out[2:]] == ["Job 4", "Job 2"]
+    # the prompt uses short numeric ids, not the board slugs
+    assert "id=1\n" in ai.seen and "very-long-slug" not in ai.seen.split("ROLES")[1].split("title=")[0]
+
+
+def test_customers_worldwide_does_not_make_a_mexico_role_reachable():
+    job = _job(location="Mexico", remote=True,
+               description="Build impactful solutions for customers worldwide.")
+    assert not D._location_ok(job, DE_REMOTE)[0]
+
+
+def test_explicit_work_from_anywhere_still_overrides_hq_city():
+    job = _job(location="Austin, Texas", remote=True,
+               description="Work from anywhere in the world. Modern C++.")
+    assert D._location_ok(job, DE_REMOTE)[0]
