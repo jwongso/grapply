@@ -454,11 +454,15 @@ _LI_CARD = re.compile(
     r'(?:.*?<time[^>]*datetime="([^"]*)")?', re.S)
 
 
-def linkedin_search(keywords: str, *, where: str = "", remote: bool = False,
-                    days: int = 0, max_jobs: int = 100,
+def linkedin_search(keywords: str, *, where: str = "", days: int = 0, max_jobs: int = 100,
                     max_pages: int = 4) -> list[dict]:
     """Search LinkedIn's guest endpoint. Returns stubs with no description -
-    call linkedin_hydrate() on the ones that survive triage."""
+    call linkedin_hydrate() on the ones that survive triage.
+
+    City search only. LinkedIn's remote filter is unreliable (hybrid and
+    "on-site 2-3x a week" roles come back under it), so it is not used and
+    results are never tagged remote.
+    """
     out: list[dict] = []
     seen: set[str] = set()
     for page in range(max_pages):
@@ -466,8 +470,6 @@ def linkedin_search(keywords: str, *, where: str = "", remote: bool = False,
         params = {"keywords": keywords, "location": where, "start": len(seen)}
         if days:
             params["f_TPR"] = f"r{int(days) * 86400}"
-        if remote:
-            params["f_WT"] = "2"
         url = f"{_LI_GUEST}/seeMoreJobPostings/search?" + \
               urllib.parse.urlencode(params)
         try:
@@ -489,7 +491,7 @@ def linkedin_search(keywords: str, *, where: str = "", remote: bool = False,
                 title=strip_html(title or ""),
                 location=strip_html(loc or "") or where,
                 url=f"https://www.linkedin.com/jobs/view/{jid}",
-                posted=posted or "", remote=True if remote else None,
+                posted=posted or "", remote=None,
             ))
         if not got or len(out) >= max_jobs:
             break

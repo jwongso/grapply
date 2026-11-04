@@ -227,3 +227,85 @@ def test_cli_list_markets(capsys):
 def test_cli_unknown_market_exits_nonzero(monkeypatch):
     monkeypatch.setattr(D.src_mod, "fetch_registry", lambda *a, **k: [])
     assert D.main(["--market", "narnia"]) == 2
+
+
+# ── Germany: Berlin on-site + Germany remote ────────────────────────────────
+
+BERLIN = D.MARKETS["berlin"]
+DE_REMOTE = D.MARKETS["germany-remote"]
+
+
+def test_dutch_town_de_lier_is_not_germany():
+    # "de" used to be a Germany token and matched "De Lier".
+    job = _job(location="De Lier, Zuid-Holland, Netherlands")
+    assert not D._location_ok(job, BERLIN)[0]
+    assert not D._location_ok(job, DE_REMOTE)[0]
+
+
+def test_named_office_is_not_made_remote_by_the_body():
+    body = "Work from anywhere in the world, worldwide team, remote culture."
+    for loc in ("Amsterdam office", "Munich, Bavaria, Germany"):
+        job = _job(location=loc, description=body)
+        assert not D._location_ok(job, DE_REMOTE)[0], loc
+
+
+def test_hybrid_role_in_other_city_is_rejected_for_remote_phase():
+    job = _job(location="Munich, Bavaria, Germany",
+               description="Able to be onsite in our offices 2-3x a week.")
+    assert not D._location_ok(job, DE_REMOTE)[0]
+    assert not D._location_ok(job, BERLIN)[0]
+
+
+def test_berlin_phase_accepts_berlin_and_rejects_other_german_cities():
+    assert D._location_ok(_job(location="Berlin, Berlin, Germany"), BERLIN)[0]
+    assert not D._location_ok(_job(location="Hamburg"), BERLIN)[0]
+
+
+def test_country_level_location_needs_plain_remote_statement():
+    remote = _job(location="Germany",
+                  description="This is a fully remote position within Germany.")
+    hybrid = _job(location="Germany",
+                  description="Hybrid working model, flexibility for remote work.")
+    assert D._location_ok(remote, DE_REMOTE)[0]
+    assert not D._location_ok(hybrid, DE_REMOTE)[0]
+
+
+def test_board_flagged_remote_in_german_city_is_reachable():
+    job = _job(location="Munich", remote=True)
+    assert D._location_ok(job, DE_REMOTE)[0]
+
+
+def test_german_titles_count_as_engineering_and_junior_is_rejected():
+    ok = D.prefilter(_job(title="Softwareentwickler C++ (m/w/d)",
+                          location="Berlin"), BERLIN)
+    assert not any("not an engineering" in r for r in ok["reject"])
+    junior = D.prefilter(_job(title="Werkstudent Softwareentwicklung C++",
+                              location="Berlin"), BERLIN)
+    assert any("junior" in r for r in junior["reject"])
+
+
+def test_linkedin_phase_keeps_only_postings_located_in_the_city(monkeypatch):
+    stubs = [
+        _job(id="linkedin:1", source="linkedin", location="Berlin, Berlin, Germany"),
+        _job(id="linkedin:2", source="linkedin", location="Munich, Bavaria, Germany"),
+        _job(id="linkedin:3", source="linkedin", location="Germany"),
+    ]
+    seen = {}
+    monkeypatch.setattr(S, "linkedin_search",
+                        lambda kw, **k: seen.update(k) or list(stubs))
+    monkeypatch.setattr(S, "linkedin_hydrate", lambda jobs, progress=None: jobs)
+    phase = {"name": "t", "keywords": ["c++"], "linkedin": True,
+             "aggregators": [], "seek_sites": [], "browser_profiles": [],
+             "use_registry": False}
+    got = D.gather_phase(phase, {"max_age_days": 7}, [], lambda s: None,
+                         market=BERLIN)
+    assert [j["id"] for j in got] == ["linkedin:1"]
+    assert "remote" not in seen          # no LinkedIn remote filter
+    assert seen["where"] == "Berlin, Germany"
+
+
+def test_remote_phase_does_not_use_linkedin():
+    assert not DE_REMOTE["linkedin"]
+    phases = {p["market"]: p for p in D.DEFAULT_CONFIG["phases"]}
+    assert not phases["germany-remote"].get("linkedin")
+    assert phases["berlin"]["linkedin"]

@@ -245,6 +245,31 @@ _REMOTE_ANYWHERE = ("worldwide", "world wide", "anywhere in the world",
                     "from anywhere", "work from anywhere", "globally remote",
                     "fully distributed")
 
+# Body-only evidence that a role is remote. "Some flexibility for remote work"
+# is a hybrid employer, so the bare word "remote" is not enough when the board
+# gave no remote flag.
+_REMOTE_STRONG = (
+    "fully remote", "100% remote", "full remote", "fully-remote",
+    "remote-first", "remote first", "remote only", "remote position",
+    "remote role", "remote job", "fully distributed", "work from anywhere",
+    "completely remote", "entirely remote", "remote within germany",
+    "remote in germany", "remote from germany", "germany remote",
+    "vollstandig remote", "komplett remote", "voll remote",
+    "100% homeoffice", "100% home office", "100 % remote",
+)
+
+# A role that asks for office days is not remote, whatever else it says.
+_ONSITE_HINT = (
+    "hybrid", "on-site", "onsite", "on site", "in the office", "in our office",
+    "days a week in", "days per week in", "vor ort", "prasenz", "bureau",
+)
+
+# Words that name a country or region, not an office. A location made only of
+# these, plus arrangement words, still names no place to commute to.
+_COUNTRY_LEVEL = ("germany", "deutschland", "europe", "european union", "eu",
+                  "emea", "eea", "dach", "worldwide", "global",
+                  "international", "united states", "usa", "uk")
+
 _US_AUTH_BLOCK = (
     "must be authorized to work in the us",
     "must be authorised to work in the us",
@@ -340,7 +365,7 @@ MARKETS: dict[str, dict[str, Any]] = {
             "right to work in the uk", "eligible to work in the uk"),
     ),
     "germany-remote": _mk(
-        "Germany (remote)", where="Germany", linkedin=True,
+        "Germany (remote)", where="Germany",
         aggregators=("arbeitnow", "remotive", "himalayas", "workingnomads",
                      "remoteok", "jobicy"),
         reachable_remote=GERMANY_REACHABLE,
@@ -552,8 +577,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "name": "Germany (remote)",
             "enabled": True,
             "market": "germany-remote",
-            "keywords": ["c++", "senior software engineer", "softwareentwickler"],
-            "linkedin": True,
+            "keywords": ["c++", "senior software engineer"],
             "seek_sites": [],
             "aggregators": ["arbeitnow", "remoteok", "remotive", "jobicy",
                             "workingnomads", "himalayas"],
@@ -795,9 +819,17 @@ def _location_ok(job: dict, market: dict | None) -> tuple[bool, str]:
         residue = residue.replace(term, " ")
     residue = re.sub(r"[^a-z0-9]+", " ", residue).strip()
     # A JD that merely mentions remote work ("hybrid", "remote-friendly") does
-    # not make a role with a named office remote: "Amsterdam office" stays an
-    # Amsterdam job. The body only decides when the location names no place.
-    if is_remote or (not residue and _any(body[:1500], REMOTE_TERMS)):
+    # not make a role with a named office remote: "Amsterdam office" or
+    # "Munich, Bavaria, Germany" stays an on-site job. Only a location with no
+    # office in it ("Germany", blank) can be settled by the body, and then only
+    # by a plain statement that the role is remote and not hybrid.
+    place = residue
+    for term in _COUNTRY_LEVEL:
+        place = re.sub(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", " ", place)
+    place = re.sub(r"\s+", " ", place).strip()
+    body_remote = (not place and _any(body[:1500], _REMOTE_STRONG)
+                   and not _any(body[:1500], _ONSITE_HINT))
+    if is_remote or body_remote:
         if _any(loc, market["reachable_remote"]):
             return True, ""
         # A JD that plainly says work-from-anywhere, HQ city notwithstanding.
@@ -1067,12 +1099,17 @@ def gather_phase(phase: dict, cfg: dict, registry: list[dict],
             step(f"Searching LinkedIn for \"{kw}\"", n - 1, len(kws))
             try:
                 stubs = src_mod.linkedin_search(
-                    kw, where=where, remote=bool(market.get("require_remote")),
-                    days=max_age, max_jobs=phase.get("linkedin_max", 100),
+                    kw, where=where, days=max_age, max_jobs=phase.get("linkedin_max", 100),
                     max_pages=phase.get("linkedin_pages", 4))
             except Exception as exc:                             # noqa: BLE001
                 log(f"  linkedin '{kw}': failed ({exc})")
                 continue
+            # LinkedIn pads a city search with nearby and region-wide roles, and
+            # it cannot be trusted on remote, so only a posting whose location
+            # names the market's own place is kept.
+            places = market.get("in_market") or ()
+            stubs = [j for j in stubs if not places or _any(
+                src_mod.fold(j.get("location") or "").lower(), places)]
             keep = [j for j in stubs if triage_title(j)]
             new = [j for j in keep if j["id"] not in seen_li]
             seen_li.update(j["id"] for j in new)
