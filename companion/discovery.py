@@ -1385,7 +1385,7 @@ def rank_candidates(jobs: list[dict], verbose: bool = True) -> list[dict]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_scan(prefilter_min: float | None = None, limit: int | None = None,
-             do_llm: bool = True, do_rank: bool = True,
+             do_llm: bool = True, do_rank: bool = False,
              include_seen: bool = True, since_days: int | None = None,
              progress: Callable[[str, int, int], None] | None = None,
              market: str | None = None,
@@ -1632,9 +1632,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--prefilter-only", action="store_true",
                     help="no LLM - fast keyword triage only")
     ap.add_argument("--no-rank", action="store_true",
-                    help="skip the comparative ranking pass")
+                    help="skip the comparative ranking pass (the default)")
     ap.add_argument("--rank", action="store_true",
-                    help="(default) rank the shortlist comparatively")
+                    help="rank the shortlist comparatively; needs a large "
+                         "model, a small one grades everything strong")
     ap.add_argument("--limit", type=int, default=None,
                     help="max postings sent to the LLM stage")
     ap.add_argument("--phase", default="",
@@ -1703,7 +1704,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         payload = run_scan(prefilter_min=args.prefilter_min, limit=args.limit,
                            do_llm=not args.prefilter_only,
-                           do_rank=not args.no_rank, since_days=since,
+                           do_rank=args.rank and not args.no_rank, since_days=since,
                            market=args.market or None)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)

@@ -794,7 +794,7 @@ function DiscoveryPanel({ settings, health }) {
   const runScan = async () => {
     setError('');
     try {
-      const r = await fetch(`${base}/discovery/run?rank=true`,
+      const r = await fetch(`${base}/discovery/run`,
                             { method: 'POST', headers: hdrs });
       if (!r.ok) {
         // Silently swallowing this was why a failed scan looked identical to

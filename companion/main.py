@@ -1875,7 +1875,7 @@ def discovery_run_endpoint(
     prefilter_min: float | None = None,
     limit: int | None = None,
     llm: bool = True,
-    rank: bool = True,
+    rank: bool = False,
     include_seen: bool = True,
     since_days: int | None = None,
     market: str | None = None,
@@ -2011,7 +2011,7 @@ _DISCOVERY_HTML = """<!DOCTYPE html>
           <div class="hint">Scores fit out of 10 and names your gaps.</div>
         </div>
         <div class="opt">
-          <label class="chk" for="rank"><input id="rank" type="checkbox" checked>
+          <label class="chk" for="rank"><input id="rank" type="checkbox">
             Have the AI put them in order</label>
           <div class="hint warn">Needs a big model. On the 8B one you are
             running it grades everything "strong" and skips numbers - leave
