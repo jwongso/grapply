@@ -295,8 +295,8 @@ WORK_AUTH_BLOCK = (
 
 DEFAULT_KEYWORDS: list[str] = [
     "senior software engineer", "senior software developer",
-    "staff software engineer", "principal software engineer", "c++",
-    "embedded software", "firmware", "softwareentwickler",
+    "staff software engineer", "principal software engineer",
+    "lead software engineer", "c++", "embedded software", "firmware", "softwareentwickler",
 ]
 
 # A JD that plainly says work-from-anywhere clears the gate for every market,
@@ -621,6 +621,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             # precision is unchanged because the gate is downstream.
             "keywords": ["senior software engineer", "senior software developer",
                          "staff software engineer", "principal software engineer",
+                         "lead software engineer",
                          "c++", "embedded software", "firmware",
                          "softwareentwickler"],
             # LinkedIn's public guest search, no login. Berlin has far more
@@ -642,7 +643,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "enabled": True,
             "market": "germany-remote",
             "keywords": ["c++", "senior software engineer",
-                         "staff software engineer", "principal software engineer"],
+                         "staff software engineer", "principal software engineer",
+                         "lead software engineer"],
             "seek_sites": [],
             "aggregators": ["arbeitnow", "remoteok", "remotive", "jobicy",
                             "workingnomads", "himalayas"],
