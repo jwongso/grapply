@@ -73,6 +73,53 @@ TITLE_REJECT = (
 # (SAP tooling, current work) are both real, shipped experience, so a posting
 # qualifies on any of the three. Priority order is reflected in the weights
 # below, not by excluding the other two here.
+# Defence industry. A scan for "senior C++ engineer" in Berlin is mostly
+# drone, counter-drone and weapons start-ups, so they are excluded by default.
+# Company names are matched as whole words against the posting's company. The
+# text terms are phrases, not the bare word "military", because US equal
+# opportunity boilerplate ("protected veteran or military status") would
+# otherwise reject half the postings. Add your own with `exclude_companies` /
+# `exclude_terms` in the discovery config, or set `allow_defence: true` to turn
+# the whole filter off.
+DEFENCE_COMPANIES = (
+    "helsing", "stark", "quantum systems", "tytan", "hensoldt", "rheinmetall",
+    "mbda", "diehl defence", "diehl defense", "krauss-maffei wegmann", "kmw",
+    "atlas elektronik", "hypersonica", "alpine eagle", "arx robotics",
+    "donaustahl", "anduril", "shield ai", "saab", "bae systems", "thales",
+    "leonardo", "airbus defence", "airbus defense", "terma", "nordic air defence",
+    "cambridge aerospace", "destinus", "tekever", "skyeton",
+)
+DEFENCE_TERMS = (
+    "defence industry", "defense industry", "defence sector", "defense sector",
+    "defence technology", "defense technology", "defence customers",
+    "defense customers", "defence and security", "defense and security",
+    "weapon*", "munition*", "bundeswehr", "warfighter*", "armed forces",
+    "dual-use", "dual use", "counter-drone", "counter-uas", "loitering",
+)
+
+
+def exclusion_reason(job: dict, cfg: dict | None = None) -> str:
+    """Why a posting is excluded by industry, or "" when it is not."""
+    cfg = cfg or {}
+    if cfg.get("allow_defence"):
+        companies, terms = (), ()
+    else:
+        companies, terms = DEFENCE_COMPANIES, DEFENCE_TERMS
+    companies = tuple(companies) + tuple(cfg.get("exclude_companies") or ())
+    terms = tuple(terms) + tuple(cfg.get("exclude_terms") or ())
+    company = src_mod.fold(job.get("company") or "").lower()
+    hit = next((c for c in companies if c and _has(company, c.lower())), "")
+    if hit:
+        return f"excluded industry: {job.get('company')} ({hit})"
+    text = src_mod.fold(
+        f"{job.get('title') or ''}\n{(job.get('description') or '')[:2500]}"
+    ).lower()
+    hit = next((t for t in terms if t and _has(text, t.lower())), "")
+    if hit:
+        return f"excluded industry: text mentions '{hit.rstrip('*')}'"
+    return ""
+
+
 REQUIRE_ANY = ("c++", "cpp", "c/c++", "c#", "csharp", ".net", "dotnet",
                "python")
 
@@ -142,9 +189,22 @@ TITLE_REJECT_DISCIPLINE = (
 TITLE_REJECT_HARDWARE = ("fpga", "asic", "verilog", "vhdl", "pcb", "rtl design")
 
 HARD_BLOCK = (
-    "security clearance", "ts/sci", "must be a u.s. citizen",
+    "must be a u.s. citizen",
     "must be a us citizen", "us citizenship is required",
-    "citizens only", "itar", "polygraph",
+    "citizens only", "itar",
+)
+
+# Any mention of a security clearance rejects the role, wherever it is located.
+# HARD_BLOCK softens to a note outside the US because American aerospace firms
+# paste ITAR boilerplate into every posting, but a clearance statement is a real
+# requirement or a sign of defence work, and the answer here is always no. The
+# German equivalents are included, with and without umlauts.
+CLEARANCE_BLOCK = (
+    "security clearance", "security-clearance", "ts/sci", "polygraph",
+    "clearance required", "eligible for clearance", "sc clearance",
+    "sicherheitsüberprüfung*", "sicherheitsueberpruefung*",
+    "sicherheitsuberprufung*", "sicherheitsfreigabe*", "sicherheitsbescheid*",
+    "geheimschutz*", "verschlusssache*", "ü2-überprüfung", "ue2-ueberpruefung",
 )
 
 # US aerospace and defence firms paste ITAR boilerplate into every posting,
@@ -858,7 +918,8 @@ def _location_ok(job: dict, market: dict | None) -> tuple[bool, str]:
                    f"{job.get('location') or '?'}")
 
 
-def prefilter(job: dict, market: "dict | str | None" = None) -> dict:
+def prefilter(job: dict, market: "dict | str | None" = None,
+              cfg: dict | None = None) -> dict:
     """Score 0-100 on keywords alone. No LLM, fully explainable."""
     title = src_mod.fold(job["title"]).lower()
     loc   = src_mod.fold(job.get("location") or "").lower()
@@ -894,12 +955,20 @@ def prefilter(job: dict, market: "dict | str | None" = None) -> dict:
     if not _any(blob, REQUIRE_ANY):
         reject.append("no C/C++ signal")
 
+    why_excluded = exclusion_reason(job, cfg)
+    if why_excluded:
+        reject.append(why_excluded)
+
     if market is not None:
         if isinstance(market, str):
             market = resolve_market(market)
         ok, why = _location_ok(job, market)
         if not ok:
             reject.append(why)
+
+    clearance = next((t for t in CLEARANCE_BLOCK if _has(blob, t)), "")
+    if clearance:
+        reject.append(f"security clearance ('{clearance.rstrip('*')}')")
 
     for t in HARD_BLOCK:
         if _has(blob, t):
@@ -1112,7 +1181,8 @@ def gather_phase(phase: dict, cfg: dict, registry: list[dict],
             places = market.get("in_market") or ()
             stubs = [j for j in stubs if not places or _any(
                 src_mod.fold(j.get("location") or "").lower(), places)]
-            keep = [j for j in stubs if triage_title(j)]
+            keep = [j for j in stubs if triage_title(j)
+                    and not exclusion_reason(dict(j, description=""), cfg)]
             new = [j for j in keep if j["id"] not in seen_li]
             seen_li.update(j["id"] for j in new)
             log(f"  linkedin '{kw}': {len(stubs)} found, "
@@ -1413,7 +1483,7 @@ def run_scan(prefilter_min: float | None = None, limit: int | None = None,
 
         kept = []
         for j in raw:
-            j.update(prefilter(j, mkt))
+            j.update(prefilter(j, mkt, cfg))
             if j["reject"]:
                 rejected += 1
                 continue

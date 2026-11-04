@@ -362,3 +362,79 @@ def test_explicit_work_from_anywhere_still_overrides_hq_city():
     job = _job(location="Austin, Texas", remote=True,
                description="Work from anywhere in the world. Modern C++.")
     assert D._location_ok(job, DE_REMOTE)[0]
+
+
+# ── defence industry exclusion ──────────────────────────────────────────────
+
+@pytest.mark.parametrize("company", ["Helsing", "STARK", "Quantum Systems GmbH",
+                                     "TYTAN Technologies", "Rheinmetall AG"])
+def test_defence_companies_are_rejected(company):
+    res = D.prefilter(_job(company=company, location="Berlin"), BERLIN)
+    assert any("excluded industry" in r for r in res["reject"])
+
+
+def test_defence_wording_in_the_jd_is_rejected():
+    job = _job(location="Berlin",
+               description="We build autonomous weapon systems for the Bundeswehr.")
+    res = D.prefilter(job, BERLIN)
+    assert any("excluded industry" in r for r in res["reject"])
+
+
+def test_us_eeo_military_boilerplate_is_not_defence():
+    job = _job(location="Berlin", company="Acme Software",
+               description="Modern C++. We do not discriminate on the basis of "
+                           "protected veteran or military status.")
+    assert D.exclusion_reason(job) == ""
+
+
+def test_company_name_must_match_whole_word():
+    assert D.exclusion_reason(_job(company="Starke Software GmbH")) == ""
+    assert D.exclusion_reason(_job(company="Stark")) != ""
+
+
+def test_defence_filter_can_be_disabled_and_extended():
+    job = _job(company="Helsing")
+    assert D.exclusion_reason(job, {"allow_defence": True}) == ""
+    assert D.exclusion_reason(_job(company="Acme"),
+                              {"exclude_companies": ["acme"]}) != ""
+    assert D.exclusion_reason(_job(description="gambling platform"),
+                              {"exclude_terms": ["gambling"]}) != ""
+
+
+def test_linkedin_does_not_hydrate_excluded_companies(monkeypatch):
+    stubs = [_job(id="linkedin:1", source="linkedin", company="Helsing",
+                  location="Berlin, Germany"),
+             _job(id="linkedin:2", source="linkedin", company="Acme",
+                  location="Berlin, Germany")]
+    hydrated = []
+    monkeypatch.setattr(S, "linkedin_search", lambda kw, **k: list(stubs))
+    monkeypatch.setattr(S, "linkedin_hydrate",
+                        lambda jobs, progress=None: hydrated.extend(jobs) or jobs)
+    phase = {"name": "t", "keywords": ["c++"], "linkedin": True,
+             "aggregators": [], "seek_sites": [], "browser_profiles": [],
+             "use_registry": False}
+    D.gather_phase(phase, {}, [], lambda s: None, market=BERLIN)
+    assert [j["id"] for j in hydrated] == ["linkedin:2"]
+
+
+# ── security clearance ──────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("text", [
+    "Active security clearance required.",
+    "Must be eligible for a Security Clearance.",
+    "TS/SCI with polygraph.",
+    "Eine erweiterte Sicherheitsüberprüfung ist erforderlich.",
+    "Sicherheitsueberpruefung nach SÜG wird vorausgesetzt.",
+])
+def test_any_clearance_statement_rejects_even_in_berlin(text):
+    res = D.prefilter(_job(location="Berlin, Germany", description=text + " C++"),
+                      BERLIN)
+    assert any(r.startswith("security clearance") for r in res["reject"]), text
+
+
+def test_clearance_is_no_longer_downgraded_to_a_note_outside_the_us():
+    res = D.prefilter(_job(location="Berlin, Berlin, Germany",
+                           description="C++ role. Security clearance a plus."),
+                      BERLIN)
+    assert res["reject"]
+    assert not any("template boilerplate" in n for n in res["notes"])
