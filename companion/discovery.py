@@ -98,13 +98,31 @@ DEFENCE_TERMS = (
 )
 
 
+# AI training platforms. These list "Software Engineer" and "Python Engineer"
+# roles that are really freelance work ranking or writing code for model
+# training, not engineering jobs. `allow_ai_training: true` turns this off.
+AI_TRAINING_COMPANIES = (
+    "alignerr", "dataannotation", "data annotation", "outlier", "scale ai",
+    "remotasks", "mercor", "micro1", "surge ai", "toloka", "appen",
+    "invisible technologies", "crowdgen", "telus digital", "prolific",
+    "handshake ai",
+)
+AI_TRAINING_TERMS = (
+    "ai trainer*", "ai training platform", "data annotation", "annotator*",
+    "data labeling", "data labelling", "ai tutor*",
+)
+
+
 def exclusion_reason(job: dict, cfg: dict | None = None) -> str:
     """Why a posting is excluded by industry, or "" when it is not."""
     cfg = cfg or {}
-    if cfg.get("allow_defence"):
-        companies, terms = (), ()
-    else:
+    companies: tuple[str, ...] = ()
+    terms: tuple[str, ...] = ()
+    if not cfg.get("allow_defence"):
         companies, terms = DEFENCE_COMPANIES, DEFENCE_TERMS
+    if not cfg.get("allow_ai_training"):
+        companies += AI_TRAINING_COMPANIES
+        terms += AI_TRAINING_TERMS
     companies = tuple(companies) + tuple(cfg.get("exclude_companies") or ())
     terms = tuple(terms) + tuple(cfg.get("exclude_terms") or ())
     company = src_mod.fold(job.get("company") or "").lower()

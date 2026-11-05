@@ -438,3 +438,31 @@ def test_clearance_is_no_longer_downgraded_to_a_note_outside_the_us():
                       BERLIN)
     assert res["reject"]
     assert not any("template boilerplate" in n for n in res["notes"])
+
+
+# ── AI training platforms ───────────────────────────────────────────────────
+
+@pytest.mark.parametrize("company", ["Alignerr", "DataAnnotation", "Outlier",
+                                     "Scale AI", "Mercor", "Appen"])
+def test_ai_training_platforms_are_rejected(company):
+    res = D.prefilter(_job(company=company, location="Berlin"), BERLIN)
+    assert any("excluded industry" in r for r in res["reject"])
+
+
+def test_ai_training_wording_in_the_jd_is_rejected():
+    job = _job(location="Berlin", company="Acme",
+               description="Join our AI training platform as an annotator.")
+    assert D.exclusion_reason(job) != ""
+
+
+def test_ai_training_filter_can_be_disabled():
+    assert D.exclusion_reason(_job(company="Alignerr"),
+                              {"allow_ai_training": True}) == ""
+    # ...without turning the defence filter off
+    assert D.exclusion_reason(_job(company="Helsing"),
+                              {"allow_ai_training": True}) != ""
+
+
+def test_normal_ai_companies_are_not_excluded():
+    for name in ("Anthropic", "DeepL", "Aleph Alpha", "Parloa"):
+        assert D.exclusion_reason(_job(company=name)) == "", name
