@@ -38,6 +38,8 @@ import random
 import re
 import sys
 import time
+import urllib.parse
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -343,7 +345,8 @@ class BrowserSession:
         except Exception:                                        # noqa: BLE001
             return ""
 
-    def search_in_page(self, page: Any, selector: str, text: str) -> bool:
+    def search_in_page(self, page: Any, selector: str, text: str, *,
+                       where_selector: str = "", where_text: str = "") -> bool:
         """Type a query into the site's own search box and submit.
 
         This is not decoration. Some SPAs server-render a directly requested
@@ -361,10 +364,76 @@ class BrowserSession:
             # Per-character typing so the SPA's input handlers actually fire.
             box.type(text, delay=random.randint(60, 130))
             self._pace()
+            # A second box for the place. Without it the site searches wherever
+            # it guesses from the IP address - Germany-wide, or nothing at all,
+            # from a New Zealand connection - and the location gate downstream
+            # throws away everything outside the target city.
+            if where_selector and where_text:
+                try:
+                    where_box = page.wait_for_selector(where_selector,
+                                                       timeout=5000)
+                    where_box.click()
+                    self._pace()
+                    where_box.press("Control+A")
+                    where_box.press("Delete")
+                    where_box.type(where_text, delay=random.randint(60, 130))
+                    self._pace()
+                    where_box.press("Enter")
+                    return True
+                except Exception:                                # noqa: BLE001
+                    pass     # fall through: keywords alone still search
             box.press("Enter")
             return True
         except Exception:                                        # noqa: BLE001
             return False
+
+    @staticmethod
+    def mosaic_dates(page: Any) -> dict[str, str]:
+        """jobkey -> ISO publication date, from the JSON Indeed embeds in the page.
+
+        The cards carry no posting date. Their only date-like text is
+        "Angesehen vor 20 Tagen" (when YOU last viewed it), and the
+        timing-attribute element holds company and location, so DOM scraping
+        yields either nothing or garbage. The page does embed pubDate per job as
+        epoch milliseconds, which agrees with the "vor 14 Tagen" label Indeed
+        prints. This is Indeed's own date, not the employer's: a repost can
+        refresh it, so callers must treat it as a board date.
+        """
+        try:
+            rows = page.evaluate("""() => {
+                try {
+                    return window.mosaic.providerData['mosaic-provider-jobcards']
+                        .metaData.mosaicProviderJobCardsModel.results
+                        .map(r => [r.jobkey, r.pubDate]);
+                } catch (e) { return []; }
+            }""") or []
+        except Exception:                                        # noqa: BLE001
+            return {}
+        out: dict[str, str] = {}
+        for key, ms in rows:
+            if key and isinstance(ms, (int, float)) and ms > 0:
+                out[str(key)] = datetime.fromtimestamp(
+                    ms / 1000, timezone.utc).isoformat(timespec="seconds")
+        return out
+
+    def _refine(self, page: Any, refine_url: str, spec: dict) -> None:
+        """Re-open the results through a clean URL that carries the age filter.
+
+        The typed search has to come first (a cold deep link gets a 403), but it
+        cannot carry the filter. Appending to the live URL fails: it holds a
+        vjk= job-preview parameter and renders a single job, not the list. So
+        build the URL from scratch, and if it returns no cards go back to the
+        unfiltered results rather than scraping nothing.
+        """
+        back = page.url
+        try:
+            page.goto(refine_url, wait_until="domcontentloaded")
+            time.sleep(3)
+            if not any(page.query_selector(sel)
+                       for sel in _as_list(spec.get("card"))):
+                page.goto(back, wait_until="domcontentloaded")
+        except Exception:                                        # noqa: BLE001
+            pass
 
     def harvest_dom(self, url: str, site: str, spec: dict, learned: dict, *,
                     max_pages: int = 5, max_jobs: int = 100,
@@ -373,6 +442,8 @@ class BrowserSession:
                     scroll_passes: int = 0, settle: float = 2.0,
                     next_selectors: Iterable[str] = (),
                     on_page: Callable[[int, int, int], None] | None = None,
+                    where_selector: str = "", where_text: str = "",
+                    refine_url: str = "",
                     ) -> list[dict]:
         """Land once, then walk the result pages by clicking through them.
 
@@ -397,8 +468,12 @@ class BrowserSession:
             if warmup:
                 self.prime(page, warmup)
             if search_selector and search_text:
-                if not self.search_in_page(page, search_selector, search_text):
+                if not self.search_in_page(page, search_selector, search_text,
+                                           where_selector=where_selector,
+                                           where_text=where_text):
                     page.goto(url, wait_until="domcontentloaded")
+                elif refine_url:
+                    self._refine(page, refine_url, spec)
             else:
                 page.goto(url, wait_until="domcontentloaded")
             self.dismiss_consent(page)
@@ -413,6 +488,12 @@ class BrowserSession:
                 time.sleep(settle)
 
                 got = extract_dom(page, site, spec, learned)
+                if spec.get("mosaic_dates"):
+                    dates = self.mosaic_dates(page)
+                    for rec in got:
+                        # Overwrite whatever the DOM yielded: an empty date is
+                        # honest, a scraped "Accenture\nBerlin" is not.
+                        rec["posted"] = dates.get(str(rec.get("ext_id")), "")
                 fresh = 0
                 for rec in got:
                     ext = str(rec.get("ext_id") or "")
@@ -768,11 +849,18 @@ SITE_PROFILES: dict[str, dict] = {
         # nearest bucket it accepts rather than passing the raw request.
         "fresh_param": lambda days: "fromage={}".format(
             min((d for d in (1, 3, 7, 14) if d >= days), default=14)),
-        # Modelled on indeed-nz (same Indeed front end, not yet verified on de.indeed.com): plain HTTP gets a hard 403 on the first
-        # request, but landing on the homepage and typing the query returns 506
-        # responses with no 403 at all and 16 result cards per page.
+        # Verified working 2026-11-24 on de.indeed.com: headed Chromium, 16
+        # cards a page. Plain HTTP gets a hard 403, so land on the homepage and
+        # type the query. The place has to be typed too: without it Indeed
+        # searches Germany-wide and every non-Berlin card is discarded later.
         "warmup": "https://de.indeed.com",
         "search_selector": "input#text-input-what, input[name=q]",
+        "where": "Berlin",
+        "where_selector": "input#text-input-where, input[name=l]",
+        "where_param": "l",
+        # Typed search first (a cold deep link is a 403), then reopen through a
+        # clean URL carrying fromage so only recent postings are paged.
+        "refine_after_search": True,
         "requires_headed": True,
         # Pinned: the signed-in session lives in the chromium profile.
         "engine": "chromium",
@@ -789,13 +877,13 @@ SITE_PROFILES: dict[str, dict] = {
                              ".companyLocation"],
                 "salary": ["[data-testid=attribute_snippet_testid]",
                            ".salary-snippet-container", ".metadata.salary"],
-                "posted": ["[data-testid=myJobsStateDate]",
-                           "[data-testid=timing-attribute]", ".date"],
                 "description": ["[data-testid=belowJobSnippet]",
                                 ".job-snippet", "ul"],
             },
             "id_from": {"sel": "a[href*='jk=']", "attr": "href",
                         "regex": r"jk=([0-9a-f]+)"},
+            # Dates come from Indeed's embedded JSON, not the cards.
+            "mosaic_dates": True,
         },
         "url_tpl": "https://de.indeed.com/viewjob?jk={ext_id}",
         "next_selectors": ("a[data-testid='pagination-page-next']",
@@ -811,7 +899,8 @@ SITE_PROFILES: dict[str, dict] = {
 }
 
 
-def _profile_url(prof: dict, keywords: str, page: int, since_days: int) -> str:
+def _profile_url(prof: dict, keywords: str, page: int, since_days: int,
+                 where: str = "") -> str:
     """Profile URL for a page, with the site's freshness filter appended.
 
     Server-side filtering is an optimisation only: it saves fetching pages of
@@ -819,6 +908,10 @@ def _profile_url(prof: dict, keywords: str, page: int, since_days: int) -> str:
     applies to every source including the ones with no such parameter.
     """
     url = prof["url"](keywords, page)
+    place = where or prof.get("where", "")
+    if place and prof.get("where_param"):
+        url += ("&" if "?" in url else "?") + urllib.parse.urlencode(
+            {prof["where_param"]: place})
     fresh = prof.get("fresh_param")
     if since_days > 0 and fresh:
         url += ("&" if "?" in url else "?") + fresh(since_days)
@@ -828,12 +921,15 @@ def _profile_url(prof: dict, keywords: str, page: int, since_days: int) -> str:
 def fetch_profile(name: str, keywords: str, *, max_jobs: int = 100,
                   max_pages: int = 3, headless: bool = True,
                   engine: str = "chromium", device: str = "desktop",
-                  since_days: int = 0,
+                  since_days: int = 0, where: str = "",
                   session: BrowserSession | None = None,
                   on_payload: Callable[[str, Any], None] | None = None,
                   on_page: Callable[[str, int, int, int], None] | None = None,
                   ) -> list[dict]:
     """Run one site profile and return normalised job dicts.
+
+    where overrides the profile's own default place, for profiles that declare
+    a where_selector / where_param.
 
     Shares the caller's session when given one, so a multi-site scan pays the
     browser launch cost once.
@@ -866,7 +962,7 @@ def fetch_profile(name: str, keywords: str, *, max_jobs: int = 100,
 
         try:
             rows = sess.harvest_dom(
-                _profile_url(prof, keywords, 1, since_days),
+                _profile_url(prof, keywords, 1, since_days, where),
                 name, dom_spec, learned,
                 max_pages=max_pages, max_jobs=max_jobs,
                 warmup=prof.get("warmup", ""),
@@ -877,6 +973,11 @@ def fetch_profile(name: str, keywords: str, *, max_jobs: int = 100,
                 settle=prof.get("settle", 2.0),
                 next_selectors=prof.get("next_selectors", ()),
                 on_page=page_note,
+                where_selector=prof.get("where_selector", ""),
+                where_text=where or prof.get("where", ""),
+                refine_url=(_profile_url(prof, keywords, 1, since_days, where)
+                            if since_days > 0 and prof.get("refine_after_search")
+                            else ""),
             )
         finally:
             save_learned(learned)
@@ -894,17 +995,29 @@ def fetch_profile(name: str, keywords: str, *, max_jobs: int = 100,
                 "location": rec.get("location", ""),
                 "url": prof.get("url_tpl", "").format(ext_id=ext),
                 "posted": rec.get("posted", ""),
+                # Indeed's own date, which a repost can refresh - never the
+                # employer's original publication.
+                "posted_kind": ("board_posted" if rec.get("posted")
+                                else "unknown"),
+                "posted_source_url": prof.get("url_tpl", "").format(ext_id=ext),
                 "salary": rec.get("salary", ""),
                 "remote": None,
                 "description": rec.get("description", ""),
             })
+        # A sponsored copy of a listing has a jobkey the embedded JSON does not
+        # know, so it arrives with no date beside the real, dated card.
+        def _same(j: dict) -> tuple[str, str, str]:
+            return (j["title"].lower(), j["company"].lower(),
+                    j["location"].lower())
+        dated = {_same(j) for j in jobs if j["posted"]}
+        jobs = [j for j in jobs if j["posted"] or _same(j) not in dated]
         return jobs[:max_jobs]
 
     try:
         for page_no in range(1, max_pages + 1):
             if len(jobs) >= max_jobs:
                 break
-            url = _profile_url(prof, keywords, page_no, since_days)
+            url = _profile_url(prof, keywords, page_no, since_days, where)
 
             payloads = sess.capture_json(
                 url, prof["capture"],
@@ -972,6 +1085,7 @@ def fetch_profiles(names: Iterable[str], keywords: str, *,
                    headless: bool = True, engine: str = "rotate",
                    device: str = "desktop", since_days: int = 0,
                    on_page: Callable[[str, int, int, int], None] | None = None,
+                   where: str = "",
                    ) -> list[dict]:
     """Run several profiles, one browser per site.
 
@@ -1005,7 +1119,8 @@ def fetch_profiles(names: Iterable[str], keywords: str, *,
                                 device=dev) as sess:
                 got = fetch_profile(n, keywords, max_jobs=max_jobs,
                                     max_pages=max_pages, session=sess,
-                                    since_days=since_days, on_page=on_page)
+                                    since_days=since_days, on_page=on_page,
+                                    where=where)
             print(f"  {n:<12} {eng:<9} {dev:<8} "
                   f"{'headed' if not head else 'headless':<8} "
                   f"{len(got):>4} jobs", file=sys.stderr)
