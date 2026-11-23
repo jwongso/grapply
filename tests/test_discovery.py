@@ -103,11 +103,11 @@ def test_germany_rejects_us_work_authorisation_in_body():
     assert "work rights" in why
 
 
-def test_germany_accepts_blank_location_from_german_board():
-    # arbeitnow is a German board; a region-less posting inherits its market.
+def test_germany_reviews_blank_location_from_german_board():
+    # A German board is not proof of the employer's remote hiring countries.
     job = _job(source="arbeitnow", location="Homeoffice", remote=True)
     ok, why = D._location_ok(job, GERMANY)
-    assert ok, why
+    assert not ok and "location conflict:" in why
 
 
 def test_nz_still_rejects_blank_location_from_german_board():
@@ -200,7 +200,8 @@ def test_run_scan_market_germany(monkeypatch):
     monkeypatch.setattr(D.src_mod, "fetch_registry", lambda *a, **k: [])
     monkeypatch.setattr(D.src_mod, "fetch_aggregators", _fake_aggregators)
 
-    out = D.run_scan(do_llm=False, do_rank=False, market="germany")
+    # This fixture exercises geography, not publication-date verification.
+    out = D.run_scan(do_llm=False, do_rank=False, market="germany", verified_only=False)
 
     ids = {j["id"] for j in out["jobs"]}
     assert "a:berlin" in ids
@@ -308,7 +309,7 @@ def test_remote_phase_does_not_use_linkedin():
     assert not DE_REMOTE["linkedin"]
     phases = {p["market"]: p for p in D.DEFAULT_CONFIG["phases"]}
     assert not phases["germany-remote"].get("linkedin")
-    assert phases["berlin"]["linkedin"]
+    assert phases["german-cities"]["linkedin"]
 
 
 # ── ranking and the "customers worldwide" leak ──────────────────────────────

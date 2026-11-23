@@ -79,6 +79,48 @@ pip install -r requirements.txt
 
 ## How It Works
 
+### Fresh job discovery
+
+Open `http://localhost:7878/discovery`, or use **Explore** in the extension.
+Discovery only reads and ranks; it never submits an application.
+
+- New configurations search Berlin first in preference, with Hamburg, Frankfurt
+  am Main and Munich also eligible, plus a separate Germany-remote phase.
+  Mandatory office attendance elsewhere is not treated as Germany-remote.
+- C++/.NET/Python matches retain their language scores. Genuinely
+  language-agnostic software and AI engineering roles can also qualify.
+  An explicit different specialist stack is not relabelled as agnostic.
+- The default window is seven days, requiring an employer's original
+  publication date. Greenhouse `updated_at` is an edit date, not a posting date.
+  Ashby `publishedAt` is **last** published, and its `isRemote` can include
+  hybrid jobs; discovery preserves these distinctions.
+- Unknown dates, board-only dates, last-publication dates and contradictory
+  office requirements appear under **Needs verification**, not the shortlist.
+  Known old vacancies are excluded. Uncertain jobs do not consume the AI budget.
+- Existing saved phases and age settings are **not automatically migrated**.
+  Use **Germany preferred cities · 7 days** for a one-off expanded scan. The
+  stack-agnostic checkbox is persisted with **Save search preferences**.
+  StepStone is not part of these discovery sources; no access-control bypasses.
+
+```bash
+# Four approved cities, strict seven-day scan, without LLM calls
+python -m companion.discovery --market german-cities --since-days 7 --prefilter-only
+
+# Inspect a supported employer URL without saving config or running a scan
+python -m companion.discovery --check-url https://job-boards.greenhouse.io/fender/jobs/8288981
+
+# Deliberate exception: broaden to unverified/undated results
+python -m companion.discovery --market berlin --since-days 7 --allow-unverified --prefilter-only
+```
+
+Evidence links and publication types are shown in results. Freshness and stack
+matching are explainable heuristics, not guarantees of employer eligibility or
+fit. The review queue can be larger than the strict shortlist when sources do
+not expose an original publication date.
+
+Source semantics: [Greenhouse Job Board API](https://docs.greenhouse.io/job-board.html)
+and [Ashby public job posting API](https://developers.ashbyhq.com/docs/public-job-posting-api).
+
 1. Navigate to any job posting
 2. Click the grapply icon → **Grab Page**
 3. Companion extracts job info (instant for SEEK / Indeed / LinkedIn; ~3–10 min LLM call on first visit to an unknown site)

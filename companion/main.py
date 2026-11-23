@@ -1774,17 +1774,19 @@ _DISCOVERY_STATE: dict = {"running": False, "stage": "idle", "done": 0,
 def _discovery_worker(prefilter_min: float | None, limit: int | None,
                       do_llm: bool, do_rank: bool, include_seen: bool,
                       since_days: int | None = None,
-                      market: str | None = None) -> None:
-    import discovery
+                      market: str | None = None,
+                      verified_only: bool | None = None) -> None:
     def progress(stage: str, done: int, total: int) -> None:
         _DISCOVERY_STATE.update(stage=stage, done=done, total=total)
     try:
+        import discovery
         _DISCOVERY_STATE.update(running=True, stage="starting", done=0,
                                 total=0, error="", finished="")
         discovery.run_scan(prefilter_min=prefilter_min, limit=limit,
                            do_llm=do_llm, do_rank=do_rank,
                            include_seen=include_seen, since_days=since_days,
-                           market=market, progress=progress)
+                           market=market, verified_only=verified_only,
+                           progress=progress)
     except Exception as exc:                                    # noqa: BLE001
         logger.exception("[discovery] scan failed")
         _DISCOVERY_STATE.update(error=str(exc), stage="error")
@@ -1796,8 +1798,10 @@ def _discovery_worker(prefilter_min: float | None, limit: int | None,
 
 @app.get("/discovery", response_class=HTMLResponse)
 def discovery_page():
+    import json
     token = CFG.get("auth_token", "")
-    return HTMLResponse(content=_DISCOVERY_HTML.replace("%%AUTH_TOKEN%%", token))
+    token_json = json.dumps(token).replace("<", "\\u003c")
+    return HTMLResponse(content=_DISCOVERY_HTML.replace("%%AUTH_TOKEN%%", token_json))
 
 
 @app.get("/discovery/results")
@@ -1879,6 +1883,7 @@ def discovery_run_endpoint(
     include_seen: bool = True,
     since_days: int | None = None,
     market: str | None = None,
+    verified_only: bool | None = None,
     _: None = Depends(_require_token),
 ):
     if _DISCOVERY_STATE["running"]:
@@ -1890,12 +1895,19 @@ def discovery_run_endpoint(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
     import threading
-    threading.Thread(
-        target=_discovery_worker,
-        args=(prefilter_min, limit, llm, rank, include_seen, since_days,
-              market or None),
-        daemon=True,
-    ).start()
+    # Publish starting before returning, so the first UI poll cannot see idle.
+    _DISCOVERY_STATE.update(running=True, stage="starting", done=0, total=0,
+                            error="", finished="")
+    try:
+        threading.Thread(
+            target=_discovery_worker,
+            args=(prefilter_min, limit, llm, rank, include_seen, since_days,
+                  market or None, verified_only),
+            daemon=True,
+        ).start()
+    except Exception as exc:
+        _DISCOVERY_STATE.update(running=False, stage="error", error=str(exc))
+        raise
     return {"started": True}
 
 
@@ -1952,6 +1964,8 @@ _DISCOVERY_HTML = """<!DOCTYPE html>
     .bar i{display:block;height:100%;background:var(--accent);width:0;transition:width .3s}
     .empty{color:var(--muted);text-align:center;padding:34px 0}
     .hits{color:var(--muted);font-size:11px;margin-top:4px}
+    .table-scroll{overflow-x:auto}
+    .evidence{min-width:220px;max-width:290px;font-size:12px;overflow-wrap:anywhere}
   </style>
 </head>
 <body>
@@ -1968,11 +1982,13 @@ _DISCOVERY_HTML = """<!DOCTYPE html>
     <div class="meta" style="margin-bottom:14px">
       Searches job boards, throws away what does not fit your CV, and hands you
       a short list. It only reads and ranks - it never applies for anything.
+      <br>Berlin preferred; Hamburg, Frankfurt and Munich also eligible.
+      Stack-agnostic software and AI engineering roles can qualify too.
     </div>
     <div class="controls">
       <div class="fld">
         <label for="pf">How picky? (0-100)</label>
-        <input id="pf" type="number" value="55" step="5" min="0" max="100">
+        <input id="pf" type="number" value="45" step="5" min="0" max="100">
         <div class="hint">A job must score at least this on keyword matching
           to survive. Lower finds more jobs but more rubbish. 45-55 is sensible.</div>
       </div>
@@ -1987,24 +2003,28 @@ _DISCOVERY_HTML = """<!DOCTYPE html>
         <select id="market">
           <option value="" selected>As configured (all enabled phases)</option>
         </select>
-        <div class="hint">Pick a country to run a one-off scan of just that
-          market - the company pages, the right job boards, and a location
-          filter for someone based there. Does not change your saved phases.</div>
+        <div class="hint">Pick a market for a one-off scan. Saved phases are
+          not automatically migrated. The preferred-cities preset does not save changes.</div>
       </div>
       <div class="fld">
         <label for="since">Posted within</label>
         <select id="since">
-          <option value="0" selected>Any time</option>
+          <option value="0">Any time</option>
           <option value="1">Last 24 hours</option>
           <option value="3">Last 3 days</option>
-          <option value="7">Last week</option>
+          <option value="7" selected>Last week</option>
           <option value="14">Last 2 weeks</option>
         </select>
-        <div class="hint">"Last 24 hours" shows only what appeared since
-          yesterday, which is what you want on a rescan. Postings whose date a
-          board does not publish are kept rather than guessed at.</div>
+        <div class="hint">Original employer publication is preferred over
+          reposts or edit dates. Unknown dates go to review in strict mode.</div>
       </div>
       <div style="min-width:280px">
+        <div class="opt">
+          <label class="chk" for="verified"><input id="verified" type="checkbox" checked>
+            Require verified original publication</label>
+          <div class="hint">Last-published, created and board dates alone do not
+            prove freshness. Uncheck deliberately for a broader scan.</div>
+        </div>
         <div class="opt">
           <label class="chk" for="llm"><input id="llm" type="checkbox" checked>
             Have the AI read each job</label>
@@ -2020,13 +2040,14 @@ _DISCOVERY_HTML = """<!DOCTYPE html>
         <div class="opt">
           <label class="chk" for="seen"><input id="seen" type="checkbox" checked>
             Include jobs I have already seen</label>
-          <div class="hint">Off means only brand-new postings. A job you have
-            not applied to is still worth seeing, so this is normally on.</div>
+          <div class="hint">Off hides previously seen jobs. First seen by this
+            app is not proof of a newly published vacancy.</div>
         </div>
       </div>
       <div style="display:flex;gap:10px;align-items:center">
         <button id="run">Run scan</button>
         <button id="refresh" class="ghost">Refresh</button>
+        <button id="preferred" class="ghost">Germany preferred cities · 7 days</button>
       </div>
     </div>
     <div class="bar"><i id="bar"></i></div>
@@ -2037,14 +2058,18 @@ _DISCOVERY_HTML = """<!DOCTYPE html>
     <h2>What to search for</h2>
     <div class="meta" style="margin-bottom:10px">
       Type the job titles you want, one per line - the same words you would
-      type into a job site. These are used on Seek and Indeed. The company
+      type into a job site. Enabled search sources use these keywords. The company
       career pages and the remote job feeds are read in full instead, so these
       words do not limit those.
       <br>Each line is a separate search, so more lines means a longer scan.
     </div>
     <div id="phases"></div>
+    <label class="chk" for="agnostic" style="margin-top:12px">
+      <input id="agnostic" type="checkbox" checked>
+      Include genuinely stack-agnostic software / AI engineering roles (C++ preferred, not required)
+    </label>
     <div style="display:flex;gap:10px;align-items:center;margin-top:12px">
-      <button id="savekw">Save keywords</button>
+      <button id="savekw">Save search preferences</button>
       <button id="resetkw" class="ghost">Reload</button>
       <span class="meta" id="kwstatus"></span>
     </div>
@@ -2054,17 +2079,65 @@ _DISCOVERY_HTML = """<!DOCTYPE html>
     <h2>Last scan</h2>
     <div class="cards" id="cards"></div>
     <div class="meta" id="generated" style="margin-top:12px"></div>
+    <div class="note" id="resultstatus" role="status" aria-live="polite"></div>
   </section>
 
   <section>
     <h2>Shortlist - your call</h2>
-    <div id="tablewrap"><div class="empty">No results yet. Run a scan.</div></div>
+    <div id="tablewrap" class="table-scroll"><div class="empty">No results yet. Run a scan.</div></div>
+  </section>
+  <section>
+    <h2>Needs verification - not on the shortlist</h2>
+    <div class="meta">Uncertain publication or conflicting location evidence stays here for your review.</div>
+    <div id="reviewwrap" class="table-scroll"><div class="empty">No review candidates.</div></div>
   </section>
 </main>
 <script>
-const TOKEN = '%%AUTH_TOKEN%%';
+const TOKEN = %%AUTH_TOKEN%%;
 const H = TOKEN ? {'X-Grapply-Token': TOKEN} : {};
 const $ = id => document.getElementById(id);
+
+function esc(value){
+  return String(value ?? '').replace(/[&<>"']/g,
+    c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function safeUrl(value){
+  try{
+    const u = new URL(value);
+    return ['https:', 'http:'].includes(u.protocol) ? u.href : '';
+  }catch{ return ''; }
+}
+
+function safeLink(label, value){
+  const url = safeUrl(value);
+  return url ? `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(label)}</a>`
+             : esc(label);
+}
+
+function stackLabel(value){
+  return ({preferred:'Preferred stack', agnostic:'Stack-agnostic', other:'Other stack'})[value] || '';
+}
+
+function publication(j){
+  const status = j.freshness?.status || 'unknown';
+  const label = ({verified_fresh:'Verified fresh', old:'Older than window',
+    unknown:'Date unknown', unverified:'Unverified original date',
+    future:'Future date', unrestricted:'Freshness not required'})[status] || 'Date unknown';
+  const basis = ({employer_first_published:'Employer first published',
+    employer_date_posted:'Employer date posted',
+    employer_last_published:'Employer last published (may be a repost)',
+    employer_created:'Employer record created (not original publication)',
+    board_posted:'Board posted / reposted', unknown:'Original publication unknown'})[j.posted_kind]
+    || 'Original publication unknown';
+  const cls = status === 'verified_fresh' ? 'v-strong' : 'v-marginal';
+  return `<span class="pill ${cls}">${label}</span>
+    <div>${esc(basis)}: ${esc(j.posted || 'unknown')}</div>
+    ${j.posted_source_url ? `<div>${safeLink('Publication evidence', j.posted_source_url)}</div>` : ''}
+    ${j.board_posted ? `<div class="meta">Board posted / reposted: ${esc(j.board_posted)}</div>` : ''}
+    ${j.updated_at ? `<div class="meta">Last updated (not publication): ${esc(j.updated_at)}</div>` : ''}
+    <div class="note">${esc(j.freshness?.reason || '')}</div>`;
+}
 
 function pill(v){
   const k = (v||'').toLowerCase();
@@ -2072,11 +2145,11 @@ function pill(v){
             : k.startsWith('worth')  ? 'v-worth'
             : k.startsWith('marg')   ? 'v-marginal'
             : k.startsWith('skip')   ? 'v-skip' : 'v-worth';
-  return v ? `<span class="pill ${cls}">${v}</span>` : '';
+  return v ? `<span class="pill ${cls}">${esc(v)}</span>` : '';
 }
 
 function render(d){
-  const c = d.counts || {}, jobs = d.jobs || [];
+  const c = d.counts || {}, jobs = d.jobs || [], review = d.review_jobs || [];
   $('cards').innerHTML = [
     ['Jobs looked at', c.fetched ?? '-',
      'Every posting pulled from every site'],
@@ -2086,69 +2159,114 @@ function render(d){
      'Passed the checks against your CV'],
     ['On your list', c.shortlist ?? jobs.length,
      'The best of those, shown below'],
-  ].map(([l,n,h]) => `<div class="card" title="${h}"><div class="n">${n}</div>` +
+    ['Needs verification', c.review ?? review.length,
+     'Uncertain dates or locations, separate from accepted matches'],
+    ['Freshness excluded', c.freshness_excluded ?? 0,
+     'Excluded by the publication-date checks'],
+  ].map(([l,n,h]) => `<div class="card" title="${h}"><div class="n">${esc(n)}</div>` +
                      `<div class="l">${l}</div>` +
                      `<div class="hint" style="margin-top:5px">${h}</div></div>`).join('');
   $('generated').textContent = d.generated
-    ? 'Last run ' + new Date(d.generated).toLocaleString() : '';
+    ? 'Last scan ' + new Date(d.generated).toLocaleString() + ' (not publication time)' : '';
 
-  if (!jobs.length){
-    $('tablewrap').innerHTML = '<div class="empty">No results yet. Run a scan.</div>';
-    return;
-  }
-  jobs.sort((a,b) => (a.rank ?? 999) - (b.rank ?? 999)
+  $('tablewrap').innerHTML = jobs.length ? jobTable(jobs)
+    : `<div class="empty">${d.generated ? 'No accepted matches in the last scan. Check the review queue below.'
+                                        : 'No results yet. Run a scan.'}</div>`;
+  $('reviewwrap').innerHTML = review.length ? jobTable(review, true)
+    : '<div class="empty">No review candidates.</div>';
+}
+
+function jobTable(jobs, review=false){
+  const sorted = jobs.slice().sort((a,b) => (a.rank ?? 999) - (b.rank ?? 999)
                   || (b.llm_score ?? 0) - (a.llm_score ?? 0));
-  const rows = jobs.map(j => {
+  const rows = sorted.map(j => {
     const hits = Object.entries(j.hits || {})
       .map(([k,v]) => k + ': ' + v.slice(0,4).join(', ')).join(' | ');
-    const notes = (j.notes || []).map(n => `<div class="note">${n}</div>`).join('');
+    const notes = (j.notes || []).map(n => `<div class="note">${esc(n)}</div>`).join('');
+    const reasons = review ? (j.review_reasons?.length ? j.review_reasons
+      : ['Date or location needs verification']).map(n => `<div class="note">${esc(n)}</div>`).join('') : '';
     const skip = (j.verdict||'').toLowerCase().startsWith('skip') ? ' class="skip"' : '';
     return `<tr${skip}>
-      <td class="rank">${j.rank ?? ''}</td>
-      <td><a href="${j.url}" target="_blank" rel="noopener">${j.title}</a>
-          <div class="hits">${hits}</div>${notes}</td>
-      <td>${j.company}</td>
-      <td class="meta">${j.location || ''}</td>
-      <td>${(j.llm_score ?? '-')}<span class="meta">/10</span>
-          <div class="meta">pf ${j.prefilter_score ?? '-'}</div></td>
+      <td class="rank">${esc(j.rank ?? '')}</td>
+      <td>${safeLink(j.title, j.url)}
+          <div class="meta">${esc(stackLabel(j.stack_match))}</div>
+          <div class="hits">${esc(hits)}</div>${notes}</td>
+      <td>${esc(j.company)}<div class="meta">${esc(j.source)}</div></td>
+      <td class="meta">${esc(j.location || 'Location unknown')}</td>
+      <td class="evidence">${publication(j)}</td>
+      <td>${esc(j.llm_score ?? '-')}<span class="meta">/10</span>
+          <div class="meta">pf ${esc(j.prefilter_score ?? '-')}</div></td>
       <td>${pill(j.verdict)}</td>
-      <td class="why">${j.why || (j.llm && j.llm.recommendation) || ''}</td>
+      <td class="why">${reasons}${esc(j.why || (j.llm && j.llm.recommendation) || '')}</td>
     </tr>`;
   }).join('');
-  $('tablewrap').innerHTML = `<table><thead><tr>
+  return `<table><thead><tr>
       <th>#</th><th>Role</th><th>Company</th><th>Location</th>
-      <th>Fit</th><th>Verdict</th><th>Why</th></tr></thead><tbody>${rows}</tbody></table>`;
+      <th>Publication evidence</th><th>Fit</th><th>Verdict</th>
+      <th>${review ? 'Review reasons' : 'Why'}</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+async function requestJson(url, options={}){
+  const r = await fetch(url, {headers:H, ...options});
+  if (!r.ok) throw new Error(`HTTP ${r.status}: ${(await r.text()).slice(0,120)}`);
+  return r.json();
 }
 
 async function loadResults(){
-  const d = await fetch('/discovery/results', {headers:H}).then(r=>r.json());
-  render(d);
+  try{
+    render(await requestJson('/discovery/results'));
+    $('resultstatus').textContent = '';
+  }catch(e){
+    $('resultstatus').textContent = 'Could not load results; any displayed list may be stale: ' + e.message;
+  }
 }
 
 let poll = null;
 async function tick(){
-  const s = await fetch('/discovery/status', {headers:H}).then(r=>r.json());
-  const pct = s.total ? Math.round(100 * s.done / s.total) : (s.running ? 5 : 0);
-  $('bar').style.width = pct + '%';
-  $('status').textContent = s.error ? ('error: ' + s.error)
-    : s.running ? `${s.stage} ${s.done}/${s.total}` : 'idle';
-  $('run').disabled = s.running;
-  if (!s.running && poll){ clearInterval(poll); poll = null; loadResults(); }
+  try{
+    const s = await requestJson('/discovery/status');
+    const pct = s.total ? Math.round(100 * s.done / s.total) : (s.running ? 5 : 0);
+    $('bar').style.width = pct + '%';
+    $('status').textContent = s.error ? ('error: ' + s.error)
+      : s.running ? `${s.stage} ${s.done}/${s.total}` : s.finished ? 'Scan finished' : 'idle';
+    $('run').disabled = s.running;
+    if (s.running && !poll) poll = setInterval(tick, 1500);
+    if (!s.running && poll){ clearInterval(poll); poll = null; await loadResults(); }
+  }catch(e){
+    $('status').textContent = 'Could not load scan status: ' + e.message;
+    $('run').disabled = false;
+  }
 }
 
 $('run').onclick = async () => {
   const q = new URLSearchParams({
     prefilter_min: $('pf').value, limit: $('lim').value,
     llm: $('llm').checked, rank: $('rank').checked,
-    include_seen: $('seen').checked, since_days: $('since').value });
+    include_seen: $('seen').checked, since_days: $('since').value,
+    verified_only: $('verified').checked });
   if ($('market').value) q.set('market', $('market').value);
-  const r = await fetch('/discovery/run?' + q, {method:'POST', headers:H});
-  if (!r.ok){ $('status').textContent = 'error: ' + (await r.text()); return; }
   $('run').disabled = true;
-  if (!poll) poll = setInterval(tick, 1500);
-  tick();
+  try{
+    await requestJson('/discovery/run?' + q, {method:'POST'});
+    if (!poll) poll = setInterval(tick, 1500);
+    await tick();
+  }catch(e){
+    $('status').textContent = 'Could not start scan: ' + e.message;
+    $('run').disabled = false;
+  }
 };
-$('refresh').onclick = loadResults;
+$('refresh').onclick = () => { loadResults(); tick(); };
+$('preferred').onclick = () => {
+  // Add the option even if config loading has not finished yet.
+  const sel = $('market');
+  if (![...sel.options].some(o => o.value === 'german-cities')){
+    const o = document.createElement('option');
+    o.value = 'german-cities'; o.textContent = 'Germany preferred cities'; sel.appendChild(o);
+  }
+  sel.value = 'german-cities';
+  $('since').value = '7'; $('verified').checked = true; $('pf').value = '45';
+  $('status').textContent = 'One-off preferred-cities preset selected. Run scan to begin; saved phases unchanged.';
+};
 
 // ── keyword editor ──────────────────────────────────────────────────────────
 // Phases are edited in place and written back whole, so anything the UI does
@@ -2161,36 +2279,40 @@ function renderPhases(){
     <div style="margin-bottom:14px">
       <label class="chk" style="padding:0 0 6px">
         <input type="checkbox" data-en="${i}" ${p.enabled !== false ? 'checked' : ''}>
-        <b style="color:var(--text)">${p.name}</b>
+        <b style="color:var(--text)">${esc(p.name)}</b>
         <span class="meta">&nbsp;${
-          (m => m === 'nz' ? 'keeps only jobs you could do from New Zealand'
+          esc((m => m === 'nz' ? 'keeps only jobs you could do from New Zealand'
              : m === 'berlin' ? 'keeps only jobs located in Berlin (plus remote from Germany)'
+             : m === 'german-cities' ? 'Berlin preferred; Hamburg, Frankfurt and Munich eligible'
+             : ['hamburg','frankfurt','munich'].includes(m) ? ('keeps jobs in ' + m)
              : m === 'germany-remote' ? 'keeps only remote jobs you could do from Germany'
              : m === 'germany' ? 'keeps only jobs you could do from Germany'
              : m === 'remote' ? 'keeps only fully remote jobs'
              : m ? ('location filter: ' + m)
-             : 'keeps everything')(p.market || p.gate)}${
+             : 'keeps everything')(p.market || p.gate))}${
           (p.browser_profiles||[]).length
-            ? ' · opens a browser for ' + p.browser_profiles
+            ? ' · opens a browser for ' + esc(p.browser_profiles
                 .map(s => s.replace(/-(nz|de)$/,'').replace(/^./, m => m.toUpperCase()))
-                .join(', ')
+                .join(', '))
             : ''}</span>
       </label>
       <textarea data-kw="${i}" rows="${Math.max(3,(p.keywords||[]).length+1)}"
         style="width:100%;background:#0f1117;border:1px solid var(--border);
                border-radius:6px;color:var(--text);padding:8px 10px;
                font-size:13px;font-family:inherit;resize:vertical"
-        >${(p.keywords||[]).join('\\n')}</textarea>
+        >${esc((p.keywords||[]).join('\\n'))}</textarea>
     </div>`).join('');
 }
 
 async function loadConfig(){
   try{
-    const d = await fetch('/discovery/config', {headers:H}).then(r=>r.json());
+    const d = await requestJson('/discovery/config');
     CFG = d.config; renderPhases();
+    $('agnostic').checked = CFG.allow_stack_agnostic !== false;
     const sel = $('market');
-    if (d.markets && sel.options.length <= 1){
+    if (d.markets){
       for (const [k, label] of Object.entries(d.markets)){
+        if ([...sel.options].some(o => o.value === k)) continue;
         const o = document.createElement('option');
         o.value = k; o.textContent = label;
         sel.appendChild(o);
@@ -2198,11 +2320,12 @@ async function loadConfig(){
     }
     $('kwstatus').textContent = d.browser && d.browser.available
       ? '' : 'browser sources unavailable (playwright not installed)';
-  }catch(e){ $('kwstatus').textContent = 'could not load config'; }
+  }catch(e){ $('kwstatus').textContent = 'could not load config: ' + e.message; }
 }
 
 $('savekw').onclick = async () => {
   if (!CFG) return;
+  CFG.allow_stack_agnostic = $('agnostic').checked;
   document.querySelectorAll('[data-kw]').forEach(t => {
     const i = +t.dataset.kw;
     CFG.phases[i].keywords = t.value.split('\\n')
@@ -2212,12 +2335,12 @@ $('savekw').onclick = async () => {
     CFG.phases[+c.dataset.en].enabled = c.checked;
   });
   $('kwstatus').textContent = 'saving...';
-  const r = await fetch('/discovery/config',
-    {method:'POST', headers:{...H,'Content-Type':'application/json'},
-     body: JSON.stringify({config: CFG})});
-  $('kwstatus').textContent = r.ok
-    ? 'saved - applies to the next scan'
-    : 'save failed: ' + (await r.text()).slice(0,90);
+  try{
+    await requestJson('/discovery/config',
+      {method:'POST', headers:{...H,'Content-Type':'application/json'},
+       body: JSON.stringify({config: CFG})});
+    $('kwstatus').textContent = 'saved - applies to the next scan';
+  }catch(e){ $('kwstatus').textContent = 'save failed: ' + e.message; }
 };
 $('resetkw').onclick = loadConfig;
 

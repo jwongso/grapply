@@ -161,7 +161,8 @@ def unmojibake(s: str) -> str:
 def _job(**kw: Any) -> dict:
     base = {"id": "", "source": "", "company": "", "title": "", "location": "",
             "url": "", "posted": "", "description": "", "salary": "",
-            "remote": None}
+            "remote": None, "posted_kind": "unknown", "posted_source_url": "",
+            "updated_at": "", "workplace_type": "", "locations": []}
     base.update(kw)
     for field in ("title", "company", "location", "description"):
         if isinstance(base.get(field), str):
@@ -173,19 +174,29 @@ def _job(**kw: Any) -> dict:
 # ATS adapters - need a company slug, give full descriptions
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _greenhouse_job(j: dict, slug: str, name: str) -> dict:
+    """An edit is not a publication. Missing first_published stays unknown."""
+    original = j.get("first_published") or ""
+    return _job(
+        id=f"gh:{slug}:{j.get('id')}", source="greenhouse", company=name,
+        title=(j.get("title") or "").strip(),
+        location=(j.get("location") or {}).get("name", ""),
+        url=j.get("absolute_url", ""),
+        posted=original,
+        posted_kind="employer_first_published" if original else "unknown",
+        posted_source_url=(f"https://boards-api.greenhouse.io/v1/boards/"
+                           f"{slug}/jobs/{j.get('id')}"),
+        updated_at=j.get("updated_at") or "",
+        description=strip_html(j.get("content", "")),
+    )
+
+
 def ats_greenhouse(slug: str, name: str) -> list[dict]:
     d = http_json(
         f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true")
     if not isinstance(d, dict):
         return []
-    return [_job(
-        id=f"gh:{slug}:{j.get('id')}", source="greenhouse", company=name,
-        title=(j.get("title") or "").strip(),
-        location=(j.get("location") or {}).get("name", ""),
-        url=j.get("absolute_url", ""),
-        posted=j.get("updated_at") or j.get("first_published") or "",
-        description=strip_html(j.get("content", "")),
-    ) for j in d.get("jobs", [])]
+    return [_greenhouse_job(j, slug, name) for j in d.get("jobs", [])]
 
 
 def ats_lever(slug: str, name: str) -> list[dict]:
@@ -200,6 +211,8 @@ def ats_lever(slug: str, name: str) -> list[dict]:
             title=(j.get("text") or "").strip(),
             location=cats.get("location", "") or "",
             url=j.get("hostedUrl", ""), posted=str(j.get("createdAt", "")),
+            posted_kind="employer_created",
+            posted_source_url=f"https://api.lever.co/v0/postings/{slug}?mode=json",
             salary=cats.get("commitment", "") or "",
             description=strip_html(
                 j.get("descriptionPlain") or j.get("description", "")),
@@ -214,16 +227,28 @@ def ats_ashby(slug: str, name: str) -> list[dict]:
         return []
     out = []
     for j in d.get("jobs", []):
+        if j.get("isListed") is False:
+            continue
         comp = j.get("compensation") or {}
         summary = ""
         if isinstance(comp, dict):
             summary = comp.get("compensationTierSummary") or ""
+        workplace = j.get("workplaceType") or ""
         out.append(_job(
             id=f"ashby:{slug}:{j.get('id')}", source="ashby", company=name,
             title=(j.get("title") or "").strip(),
             location=j.get("location", "") or "",
             url=j.get("jobUrl", ""), posted=j.get("publishedAt", ""),
-            salary=summary, remote=j.get("isRemote"),
+            # Ashby documents publishedAt as LAST published, and isRemote as
+            # true for both Hybrid and Remote. Preserve those distinctions.
+            posted_kind="employer_last_published",
+            posted_source_url=f"https://api.ashbyhq.com/posting-api/job-board/{slug}",
+            salary=summary,
+            remote=True if workplace == "Remote" else (
+                False if workplace in ("Hybrid", "OnSite") else None),
+            workplace_type=workplace,
+            locations=[j.get("location", "")] + [
+                row.get("location", "") for row in j.get("secondaryLocations", [])],
             description=strip_html(
                 j.get("descriptionHtml") or j.get("descriptionPlain", "")),
         ))
@@ -248,6 +273,8 @@ def ats_smartrecruiters(slug: str, name: str) -> list[dict]:
                                            loc.get("country")) if x),
             url=f"https://jobs.smartrecruiters.com/{slug}/{j.get('id')}",
             posted=j.get("releasedDate", ""),
+            posted_kind="employer_last_published",
+            posted_source_url=f"https://api.smartrecruiters.com/v1/companies/{slug}/postings/{j.get('id')}",
             remote=bool(loc.get("remote")),
         )))
 
@@ -281,6 +308,8 @@ def ats_workable(slug: str, name: str) -> list[dict]:
                                if x),
             url=j.get("url" ) or j.get("application_url", ""),
             posted=j.get("published_on", ""),
+            posted_kind="employer_last_published",
+            posted_source_url=f"https://apply.workable.com/api/v1/widget/accounts/{slug}?details=true",
             remote=j.get("telecommuting"),
             description=strip_html(
                 (j.get("description") or "") + "\n" +
@@ -296,6 +325,39 @@ ATS_ADAPTERS: dict[str, Callable[[str, str], list[dict]]] = {
     "smartrecruiters": ats_smartrecruiters,
     "workable":        ats_workable,
 }
+
+
+def verify_posting_url(url: str) -> dict | None:
+    """Read a supported public employer posting, never an arbitrary URL.
+
+    No application POST, cookies, login, redirect-unwrapping or inferred domain.
+    Unsupported/unsafe input is rejected before any network call.
+    """
+    parsed = urllib.parse.urlsplit(url.strip())
+    if (parsed.scheme != "https" or parsed.username or parsed.password
+            or parsed.port not in (None, 443)):
+        raise ValueError("Use a public HTTPS Greenhouse or Ashby employer posting URL")
+    host = (parsed.hostname or "").lower()
+    gh_hosts = {"boards.greenhouse.io", "job-boards.greenhouse.io",
+                "boards.eu.greenhouse.io", "job-boards.eu.greenhouse.io"}
+    if host in gh_hosts:
+        match = re.fullmatch(r"/([a-zA-Z0-9_-]+)/jobs/(\d+)/?", parsed.path)
+        if match:
+            slug, jid = match.groups()
+            api = f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs/{jid}"
+            data = http_json(api)
+            if not isinstance(data, dict) or str(data.get("id")) != jid:
+                return None
+            result = _greenhouse_job(data, slug, data.get("company_name") or slug)
+            result["url"] = result.get("url") or url
+            return result
+    if host == "jobs.ashbyhq.com":
+        match = re.fullmatch(r"/([a-zA-Z0-9_-]+)/([a-fA-F0-9-]{36})/?", parsed.path)
+        if match:
+            slug, jid = match.groups()
+            return next((j for j in ats_ashby(slug, slug)
+                         if j["id"] == f"ashby:{slug}:{jid}"), None)
+    raise ValueError("Unsupported employer URL; use a Greenhouse or Ashby job link")
 
 
 def fetch_registry(sources: Iterable[dict],
@@ -388,6 +450,7 @@ def seek_search(keywords: str, *, site: str = "nz", where: str = "",
                 location=label or where,
                 url=f"{base}/job/{j.get('id')}",
                 posted=j.get("listingDate", ""),
+                posted_kind="board_posted", posted_source_url=f"{base}/job/{j.get('id')}",
                 salary=j.get("salaryLabel", "") or "",
                 remote="remote" in arrangement,
                 description=j.get("teaser", "") or "",
@@ -492,6 +555,8 @@ def linkedin_search(keywords: str, *, where: str = "", days: int = 0, max_jobs: 
                 location=strip_html(loc or "") or where,
                 url=f"https://www.linkedin.com/jobs/view/{jid}",
                 posted=posted or "", remote=None,
+                posted_kind="board_posted",
+                posted_source_url=f"https://www.linkedin.com/jobs/view/{jid}",
             ))
         if not got or len(out) >= max_jobs:
             break
@@ -537,6 +602,7 @@ def agg_arbeitnow() -> list[dict]:
         company=j.get("company_name", ""), title=(j.get("title") or "").strip(),
         location=j.get("location", ""), url=j.get("url", ""),
         posted=str(j.get("created_at", "")), remote=bool(j.get("remote")),
+        posted_kind="board_posted", posted_source_url=j.get("url", ""),
         description=strip_html(j.get("description", "")),
     ) for j in rows]
 

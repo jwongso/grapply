@@ -9,7 +9,7 @@ fallback. Each phase decides its own sources and its own location gate, so
 "remote" means remote in the phase that wants it and is irrelevant in the one
 that does not.
 
-  phase 1  Berlin        Arbeitnow + Indeed Germany + the company registry
+  phase 1  German cities Arbeitnow + LinkedIn + Indeed + company registry
   phase 2  Remote        Germany-reachable remote aggregators + the registry
 
 Each phase names a market (discovery.MARKETS) that supplies its location gate
@@ -42,6 +42,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
+from urllib.parse import urlsplit
 
 try:
     from . import sources as src_mod
@@ -71,8 +72,8 @@ TITLE_REJECT = (
 # The NZ market is far too small to gate on C++ alone - that rejected roughly
 # 97% of everything fetched. C#/.NET (Framecad, AWS-backed services) and Python
 # (SAP tooling, current work) are both real, shipped experience, so a posting
-# qualifies on any of the three. Priority order is reflected in the weights
-# below, not by excluding the other two here.
+# qualifies on any of the three. Stack-agnostic software roles can also pass;
+# priority order is reflected in the weights rather than a C++-only gate.
 # Defence industry. A scan for "senior C++ engineer" in Berlin is mostly
 # drone, counter-drone and weapons start-ups, so they are excluded by default.
 # Company names are matched as whole words against the posting's company. The
@@ -314,7 +315,7 @@ WORK_AUTH_BLOCK = (
 DEFAULT_KEYWORDS: list[str] = [
     "senior software engineer", "senior software developer",
     "staff software engineer", "principal software engineer",
-    "lead software engineer", "c++", "embedded software", "firmware", "softwareentwickler",
+    "lead software engineer", "senior AI engineer", "c++", "embedded software", "firmware", "softwareentwickler",
 ]
 
 # A JD that plainly says work-from-anywhere clears the gate for every market,
@@ -404,6 +405,8 @@ GERMANY_REACHABLE = (
     "cet", "cest", "central european", "dach", "remote europe",
     "europe-based", "europe based") + GERMANY_TERMS
 
+APPROVED_CITIES = ("berlin", "hamburg", "frankfurt", "munich", "münchen", "munchen", "muenchen")
+
 MARKETS: dict[str, dict[str, Any]] = {
     "nz": _mk(
         "New Zealand", where="New Zealand", seek_sites=("nz",),
@@ -483,6 +486,27 @@ MARKETS: dict[str, dict[str, Any]] = {
         require_remote=True,
     ),
 }
+
+# Independent office destinations, not a claim that Hamburg is commutable
+# from Berlin. Keep the Berlin-only market available for narrower scans.
+MARKETS["german-cities"] = _mk(
+    "Berlin preferred; Hamburg, Frankfurt, Munich", where="Germany", linkedin=True,
+    browser_profiles=("indeed-de",), aggregators=("arbeitnow",),
+    in_market=APPROVED_CITIES, reachable_remote=GERMANY_REACHABLE,
+    work_auth_block=MARKETS["berlin"]["work_auth_block"],
+)
+for _city, _aliases in (("hamburg", ("hamburg",)), ("frankfurt", ("frankfurt",)),
+                         ("munich", ("munich", "münchen", "munchen", "muenchen"))):
+    MARKETS[_city] = _mk(
+        f"{_city.title()}, Germany", where=f"{_city.title()}, Germany", linkedin=True,
+        browser_profiles=("indeed-de",), aggregators=("arbeitnow",),
+        in_market=_aliases, reachable_remote=GERMANY_REACHABLE,
+        work_auth_block=MARKETS["berlin"]["work_auth_block"],
+    )
+
+for _market_name in ("germany", "berlin", "german-cities", "hamburg", "frankfurt",
+                     "munich", "germany-remote", "eu-remote", "remote"):
+    MARKETS[_market_name]["require_remote_region_evidence"] = True
 
 
 def resolve_market(spec: Any, cfg: dict | None = None) -> dict | None:
@@ -582,6 +606,15 @@ WEIGHTS: dict[str, tuple[int, tuple[str, ...]]] = {
         "senior", "staff", "principal", "lead", "architect", "expert",
         "specialist",
     )),
+    "software_delivery": (20, (
+        "backend", "api design", "architecture", "testing", "code review",
+        "reliability", "distributed systems", "mentoring", "observability",
+    )),
+    "applied_ai": (20, (
+        "llm", "rag", "retrieval", "agents", "agentic", "evaluation",
+        "inference", "embeddings", "tool calling", "mcp", "generative ai",
+        "ai engineer", "artificial intelligence", "machine learning",
+    )),
 }
 
 # Genuine gaps. A keyword match that dies in the first technical call is worse
@@ -629,17 +662,16 @@ DEFAULT_SOURCES: list[dict[str, str]] = [
 DEFAULT_CONFIG: dict[str, Any] = {
     "phases": [
         {
-            "name": "Berlin, Germany",
+            "name": "Berlin preferred; Hamburg, Frankfurt, Munich",
             "enabled": True,
-            "market": "berlin",
+            "market": "german-cities",
             # Searching "c++" alone is too narrow: boards tokenise the plus
             # signs unpredictably and plenty of matching roles never put it in
-            # the title. Cast wide on job titles and let the prefilter enforce
-            # the C++ requirement against the full JD - recall goes up, and
-            # precision is unchanged because the gate is downstream.
+            # the title. Cast wide on job titles and let the prefilter evaluate
+            # language evidence or a genuinely stack-agnostic software role.
             "keywords": ["senior software engineer", "senior software developer",
                          "staff software engineer", "principal software engineer",
-                         "lead software engineer",
+                         "lead software engineer", "senior AI engineer",
                          "c++", "embedded software", "firmware",
                          "softwareentwickler"],
             # LinkedIn's public guest search, no login. Berlin has far more
@@ -679,11 +711,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "default_keywords": DEFAULT_KEYWORDS,
     "prefilter_min": 45.0,
     "llm_limit": 25,
-    # Only consider postings newer than this many days. 0 disables the filter
-    # and every posting a source returns is considered, which is the default:
-    # a role posted three weeks ago is still open. Set it (or pass --since-days)
-    # when the standing list has gone stale and you only want what is new.
-    "max_age_days": 0,
+    # New installations require an original employer publication within seven
+    # days. Explicit saved settings are preserved; age=0 disables only the age
+    # limit, not the independent requirement for original-date evidence.
+    "max_age_days": 7,
+    "require_verified_posted": True,
+    "allow_stack_agnostic": True,
     # Seek detail calls per phase. This is a total now that stubs are
     # de-duplicated across keywords, not a per-keyword budget - set it below
     # the unique candidate count and you silently throw away good matches.
@@ -779,32 +812,48 @@ def parse_posted(value: Any) -> datetime | None:
 
 
 def filter_by_age(jobs: list[dict], days: int,
-                  log: Callable[[str], None] | None = None) -> list[dict]:
-    """Keep postings newer than `days`. days <= 0 disables the filter.
+                  log: Callable[[str], None] | None = None, *,
+                  verified_only: bool = False, review: list[dict] | None = None,
+                  now: datetime | None = None) -> list[dict]:
+    """Separate verified original publication from refresh/board evidence.
 
-    Postings whose date cannot be parsed are KEPT, not dropped. Dropping them
-    would silently discard real openings whenever a source stops populating a
-    date, which is a much worse failure than letting a few stale ones through.
-    The count is logged so a source that has gone dateless is visible.
+    Legacy broad mode keeps unknown dates, with an explicit warning. Strict
+    mode sends unknown or non-original evidence to review, never the shortlist.
+    A prior observation can disprove freshness but cannot prove publication.
     """
-    if days <= 0:
-        return jobs
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    kept, dropped, undated = [], 0, 0
+    now = now or datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=max(0, days))
+    kept, dropped, uncertain = [], 0, 0
     for j in jobs:
         dt = parse_posted(j.get("posted"))
-        if dt is None:
-            undated += 1
-            kept.append(j)
-        elif dt >= cutoff:
-            kept.append(j)
+        first_seen = parse_posted(j.get("first_seen_at"))
+        original = j.get("posted_kind") in {
+            "employer_first_published", "employer_date_posted"}
+        # A private ATS draft may have been created months before publication.
+        public_date = dt if j.get("posted_kind") != "employer_created" else None
+        if days > 0 and ((public_date and public_date < cutoff) or (first_seen and first_seen < cutoff)):
+            status, reason = "old", "Publication or prior observation predates the search window."
+        elif dt and dt > now:
+            status, reason = "future", "Publication date is in the future; check the source."
+        elif not dt:
+            status, reason = "unknown", "No usable original publication date."
+        elif not original:
+            status, reason = "unverified", "Board, creation or last-publication date is not proof of original publication."
         else:
+            status = "verified_fresh" if days > 0 else "unrestricted"
+            reason = "Employer original publication date verified."
+        j["freshness"] = {"status": status, "reason": reason}
+        if status == "old":
             dropped += 1
-    if log and (dropped or undated):
-        msg = f"  freshness (<= {days}d): dropped {dropped} older postings"
-        if undated:
-            msg += f", kept {undated} with no usable date"
-        log(msg)
+        elif status == "future" or (verified_only and status in {"unknown", "unverified"}):
+            uncertain += 1
+            j.setdefault("review_reasons", []).append(reason)
+            if review is not None:
+                review.append(j)
+        else:
+            kept.append(j)
+    if log:
+        log(f"  freshness: excluded {dropped} old; {uncertain} require review")
     return kept
 
 
@@ -884,18 +933,50 @@ def _location_ok(job: dict, market: dict | None) -> tuple[bool, str]:
         return True, ""
 
     loc  = src_mod.fold(job.get("location") or "").lower()
-    body = src_mod.fold(job.get("description") or "").lower()[:3000]
+    body = src_mod.fold(job.get("description") or "").lower()
     is_remote = bool(job.get("remote")) or _any(loc, REMOTE_TERMS)
 
-    # 1. Physically in the market. An office address settles it outright.
-    if market["in_market"] and _any(loc, market["in_market"]):
-        return True, ""
+    # An explicit office obligation takes precedence over a board's city tag.
+    # Mere mentions (customers/HQ/travel) do not imply a required office.
+    office_cities = GERMANY_TERMS[2:-1] + ("münchen", "amsterdam", "london", "paris")
+    required_cities = set()
+    for city in office_cities:
+        name = re.escape(city)
+        patterns = (
+            rf"(?:must|require[ds]?|expected|able to|based|work from).{{0,65}}\b{name}\s+office\b",
+            rf"\b{name}\s+office\b.{{0,60}}(?:days? (?:a|per) week|times a week|onsite|on-site)",
+            rf"(?:office|buro|standort)\s+(?:in\s+)?{name}\b.{{0,60}}(?:days? (?:a|per) week|tage|vor ort)",
+        )
+        if any(re.search(p, body) for p in patterns):
+            required_cities.add(city)
+    if required_cities:
+        if market.get("require_remote"):
+            return False, "location conflict: required office attendance is not fully remote"
+        allowed = market.get("in_market", ())
+        if not all(_any(city, allowed) for city in required_cities):
+            return False, "location conflict: required office in " + ", ".join(sorted(required_cities))
+        def city_aliases(city: str) -> tuple:
+            munich = ("munich", "munchen", "münchen", "muenchen")
+            return munich if city in munich else (city,)
 
-    # 2. An explicit work-authorisation demand in the body overrides any
+        if loc and not all(_any(loc, city_aliases(city)) for city in required_cities):
+            return False, "location conflict: advertised location differs from required office in " + ", ".join(sorted(required_cities))
+
+    if market.get("require_remote") and job.get("workplace_type") in {"Hybrid", "OnSite"}:
+        return False, "not remote: employer specifies " + job["workplace_type"]
+    if market.get("in_market") == APPROVED_CITIES or market is MARKETS["frankfurt"]:
+        if re.search(r"frankfurt\s*(?:\(\s*oder|an der oder)", loc):
+            return False, "not an approved office destination: Frankfurt (Oder) is not Frankfurt am Main"
+
+    # An explicit work-authorisation demand in the body overrides any
     #    location string, which is often just a head-office address.
     auth = next((t for t in market["work_auth_block"] if t and t in body), "")
     if auth:
         return False, f"needs work rights not held ('{auth}')"
+
+    # Physically in the market, after contradictions and explicit obligations.
+    if market["in_market"] and _any(loc, market["in_market"]):
+        return True, ""
 
     # 3. Remote - but remote from where?
     #    Strip the arrangement words. Whatever survives is a place.
@@ -920,6 +1001,11 @@ def _location_ok(job: dict, market: dict | None) -> tuple[bool, str]:
         # A JD that plainly says work-from-anywhere, HQ city notwithstanding.
         if _any(body[:900], _REMOTE_ANYWHERE):
             return True, ""
+        explicit_remote_region = re.search(
+            r"(?:remote (?:within|in|from|across)|work from anywhere in)\s+"
+            r"(germany|deutschland|europe|the eu)\b", body)
+        if explicit_remote_region and _any(explicit_remote_region.group(1), market["reachable_remote"]):
+            return True, ""
         # Whatever survives did not match the reachable list, so it is a place
         # he cannot work from. Rejecting unknown regions by default beats
         # enumerating Earth.
@@ -932,6 +1018,8 @@ def _location_ok(job: dict, market: dict | None) -> tuple[bool, str]:
         if home and not _any(home.lower(), market["reachable_remote"]):
             return False, (f"{job.get('source')} is a {home} board and this "
                            f"posting names no region - assuming {home}")
+        if market.get("require_remote_region_evidence"):
+            return False, "location conflict: remote country eligibility is not stated"
         return True, ""
 
     # 4. Not in the market and not remote.
@@ -975,8 +1063,47 @@ def prefilter(job: dict, market: "dict | str | None" = None,
             reject.append(f"body advertises a junior/entry role ('{t}')")
             break
 
-    if not _any(blob, REQUIRE_ANY):
-        reject.append("no C/C++ signal")
+    # No language in a software JD is not evidence of a different mandatory
+    # stack. Conversely an explicit Ruby/Rails specialist is not 'agnostic'.
+    preferred = _any(blob, REQUIRE_ANY)
+    other_languages = ("ruby", "rails", "php", "laravel", "java", "kotlin",
+                       "golang", "go", "rust", "typescript", "javascript",
+                       "node.js", "swift", "scala", "elixir", "dart")
+    # Optional exposure is not a prescribed stack. Keep bare 'go' out of
+    # business prose unless it has programming/experience context.
+    required_other = False
+    prescribed_other = False
+    for sentence in re.split(r"[\n;.!?,]+\s*|\b(?:but|whereas|while)\b", blob):
+        matches = [t for t in other_languages if _has(sentence, t)]
+        go_context = (r"\bgo\b.{0,30}(?:experience|programming|development)|"
+                      r"(?:experience|proficiency|knowledge|expert).{0,30}\bgo\b")
+        if matches == ["go"] and not re.search(go_context, sentence):
+            continue
+        optional = bool(re.search(
+            r"optional|nice to have|a plus|bonus|not required|not essential", sentence))
+        if matches and not optional:
+            prescribed_other = True
+            mandatory = bool(re.search(
+                r"\bmust\b|\brequired\b|\bexpert\b|\bessential\b|\bmandatory\b", sentence))
+            alternatives = bool(re.search(r"\b(?:or|any)\b|such as|for example", sentence))
+            if mandatory and not _any(sentence, REQUIRE_ANY) and not alternatives:
+                required_other = True
+    language_flexible = bool(re.search(
+        r"language[- ]agnostic|(?:any|one or more|at least one) (?:modern )?(?:programming )?language|"
+        r"(?:more than|rather than|regardless of) (?:a |the |any )?(?:specific )?language|"
+        r"no (?:specific )?language (?:requirement|required)|"
+        r"not (?:tied|limited) to (?:a |any )?(?:specific )?language", blob))
+    if re.search(r"(?:not (?:a |an )?|isn.t |not considered )language[- ]agnostic", blob):
+        language_flexible = False
+    stack_match = ("other" if required_other else "preferred" if preferred else
+                   "agnostic" if language_flexible or not prescribed_other else "other")
+    if stack_match == "agnostic":
+        if (cfg or {}).get("allow_stack_agnostic", True):
+            notes.append("Stack-agnostic software role: no prescribed different language; assess engineering fit.")
+        else:
+            reject.append("stack-agnostic roles disabled")
+    elif stack_match == "other":
+        reject.append("different explicit stack; not language-agnostic")
 
     why_excluded = exclusion_reason(job, cfg)
     if why_excluded:
@@ -1024,6 +1151,7 @@ def prefilter(job: dict, market: "dict | str | None" = None,
     return {
         "prefilter_score": round(max(0.0, min(100.0, score)), 1),
         "hits": hits, "penalties": pen, "notes": notes, "reject": reject,
+        "stack_match": stack_match,
     }
 
 
@@ -1051,31 +1179,93 @@ def triage_title(job: dict) -> bool:
 _NOISE = re.compile(r"[^a-z0-9+ ]+")
 
 
-def _dedupe_key(job: dict) -> tuple[str, str]:
+def _dedupe_key(job: dict) -> tuple[str, str, str]:
     title = _NOISE.sub(" ", src_mod.fold(job.get("title", "")).lower())
-    title = re.sub(r"\b(senior|snr|sr|junior|jnr|lead|principal|staff)\b",
-                   " ", title)
+    title = re.sub(r"\b(?:snr|sr)\b", "senior", title)
     company = _NOISE.sub(" ", src_mod.fold(job.get("company", "")).lower())
-    return (" ".join(title.split()), " ".join(company.split()))
+    loc = src_mod.fold(job.get("location", "")).lower().replace("münchen", "munich")
+    loc = _NOISE.sub(" ", loc)
+    loc = re.sub(r"\b(?:germany|deutschland|german)\b", " ", loc)
+    loc = re.sub(r"\b(?:munchen|muenchen)\b", "munich", loc)
+    return (" ".join(title.split()), " ".join(company.split()), " ".join(loc.split()))
 
 
 def dedupe(jobs: list[dict]) -> list[dict]:
-    """Keep the richest copy of each role: the one with the longest JD, since
-    that is what the prefilter and the LLM both read."""
-    best: dict[tuple[str, str], dict] = {}
+    """Prefer original employer evidence before description length.
+
+    Distinct seniority levels and office locations must not collapse into a
+    single role. Retain alternate IDs so dismissals cover duplicate sources.
+    """
+    best: dict[tuple, dict] = {}
+
+    def employer(j: dict) -> bool:
+        return (str(j.get("posted_kind", "")).startswith("employer_") or
+                j.get("source") in src_mod.ATS_ADAPTERS)
+
+    def canonical(j: dict) -> str:
+        try:
+            parsed = urlsplit(j.get("url") or "")
+        except ValueError:
+            return ""
+        host = (parsed.hostname or "").lower()
+        if host in {"boards.greenhouse.io", "job-boards.greenhouse.io"}:
+            host = "job-boards.greenhouse.io"
+        if host not in {"job-boards.greenhouse.io", "boards.eu.greenhouse.io",
+                        "job-boards.eu.greenhouse.io", "jobs.ashbyhq.com", "jobs.lever.co"}:
+            return ""
+        return host + parsed.path.rstrip("/")
+
+    employer_ids: dict[tuple, set[str]] = {}
+    canonical_ids: dict[str, str] = {}
     for j in jobs:
-        k = _dedupe_key(j)
-        if not k[0]:
+        if employer(j):
+            employer_ids.setdefault(_dedupe_key(j), set()).add(j["id"])
+            if canonical(j):
+                canonical_ids[canonical(j)] = j["id"]
+    all_employer_ids = {jid for ids in employer_ids.values() for jid in ids}
+
+    def quality(j: dict) -> tuple[int, int]:
+        kind = j.get("posted_kind")
+        authority = (3 if kind in {"employer_first_published", "employer_date_posted"}
+                     else 2 if employer(j) else 1)
+        return authority, len(j.get("description") or "")
+
+    for row in jobs:
+        j = dict(row)
+        metadata = _dedupe_key(j)
+        if not metadata[0]:
             continue
-        cur = best.get(k)
-        if cur is None or len(j.get("description", "")) > len(
-                cur.get("description", "")):
-            if cur is not None:
-                j.setdefault("also_on", []).extend(
-                    [cur.get("source", "")] + cur.get("also_on", []))
-            best[k] = j
+        # A title/company/city is not a requisition ID. Only use fuzzy board
+        # reconciliation when exactly one employer requisition can match.
+        possible = employer_ids.get(metadata, set())
+        identity = j["id"] if employer(j) else canonical_ids.get(canonical(j))
+        if not identity:
+            identity = (next(iter(possible)) if len(possible) == 1 and not canonical(j)
+                        else canonical(j) or j["id"])
+        if employer(j) or identity in all_employer_ids:
+            k = ("employer", identity)
+        elif canonical(j):
+            k = ("url", canonical(j))
         else:
-            cur.setdefault("also_on", []).append(j.get("source", ""))
+            k = metadata + (identity,)
+        cur = best.get(k)
+        if cur is None:
+            best[k] = j
+            continue
+        winner, other = (j, cur) if quality(j) > quality(cur) else (cur, j)
+        winner["also_on"] = list(set(winner.get("also_on", []) +
+                                     other.get("also_on", []) + [other.get("source", "")]))
+        winner["alternate_ids"] = sorted(set(winner.get("alternate_ids", []) +
+                                              other.get("alternate_ids", []) + [other["id"]]))
+        if other.get("posted_kind") == "board_posted":
+            winner["board_posted"] = other.get("posted", "")
+        elif other.get("board_posted"):
+            winner["board_posted"] = other["board_posted"]
+        observations = [d for d in (parse_posted(winner.get("first_seen_at")),
+                                     parse_posted(other.get("first_seen_at"))) if d]
+        if observations:
+            winner["first_seen_at"] = min(observations).isoformat()
+        best[k] = winner
     for j in best.values():
         if j.get("also_on"):
             # Only worth showing when the duplicate came from a different
@@ -1272,10 +1462,8 @@ def gather_phase(phase: dict, cfg: dict, registry: list[dict],
             if len(jobs) == before:
                 log("  browser returned nothing - JSON sources still apply")
 
-    # Applied once, here, so the guarantee holds for every source rather than
-    # only the two that accept a date parameter. The server-side params above
-    # just mean there is less to throw away.
-    jobs = filter_by_age(jobs, max_age, log)
+    # Apply freshness after cross-source dedupe in run_scan. Filtering an old
+    # employer original here would let a newer board repost conceal its age.
 
     for j in jobs:
         j.setdefault("phase", phase.get("name", market.get("label", "")))
@@ -1412,6 +1600,7 @@ def run_scan(prefilter_min: float | None = None, limit: int | None = None,
              include_seen: bool = True, since_days: int | None = None,
              progress: Callable[[str, int, int], None] | None = None,
              market: str | None = None,
+             verified_only: bool | None = None,
              ) -> dict:
     """Full scan across every enabled phase, persisted to disk.
 
@@ -1445,6 +1634,8 @@ def run_scan(prefilter_min: float | None = None, limit: int | None = None,
         limit = int(cfg.get("llm_limit", 25))
     if since_days is not None:
         cfg = dict(cfg, max_age_days=int(since_days))
+    if verified_only is None:
+        verified_only = bool(cfg.get("require_verified_posted", True))
     max_age = int(cfg.get("max_age_days", 0) or 0)
     if max_age > 0:
         log(f"freshness: postings from the last {max_age} day(s) only")
@@ -1469,9 +1660,7 @@ def run_scan(prefilter_min: float | None = None, limit: int | None = None,
         try:
             phase_markets.append(forced_market or resolve_market(p, cfg))
         except ValueError as exc:
-            log(f"  !! {exc} - phase {p.get('name', '?')!r} will not gate on "
-                f"location")
-            phase_markets.append(None)
+            raise ValueError(f"{exc} in phase {p.get('name', '?')!r}") from exc
 
     all_jobs: list[dict] = []
     survivors: list[dict] = []
@@ -1501,31 +1690,64 @@ def run_scan(prefilter_min: float | None = None, limit: int | None = None,
             + (f"  (market: {mkt['label']})" if mkt else ""))
 
         raw = gather_phase(phase, cfg, registry, log, registry_jobs, tick, mkt)
-        raw = [j for j in raw if j["id"] not in hidden]
-        all_jobs.extend(raw)
-
-        kept = []
         for j in raw:
-            j.update(prefilter(j, mkt, cfg))
-            if j["reject"]:
-                rejected += 1
-                continue
-            if j["prefilter_score"] >= prefilter_min:
-                kept.append(j)
-        log(f"  -> {len(kept)} passed prefilter (>= {prefilter_min})")
-        per_phase.append({"name": name, "fetched": len(raw), "kept": len(kept)})
-        survivors.extend(kept)
+            if j["id"] in seen:
+                j["first_seen_at"] = seen[j["id"]]
+        all_jobs.extend(raw)
+        per_phase.append({"name": name, "fetched": len(raw), "kept": 0})
 
     # Dedupe across phases and sources, then rank by the cheap score first so
     # the LLM budget goes to the most promising postings.
-    before = len(survivors)
-    survivors = dedupe(survivors)
-    if before != len(survivors):
-        log(f"\ndeduped {before} -> {len(survivors)}")
+    candidates = dedupe(all_jobs)
+    review_jobs: list[dict] = []
+    eligible: list[dict] = []
+    for j in candidates:
+        if hidden.intersection([j["id"]] + j.get("alternate_ids", [])):
+            continue
+        if not include_seen and any(i in seen for i in [j["id"]] + j.get("alternate_ids", [])):
+            continue
+        evaluations = [prefilter(j, mkt, cfg) for mkt in phase_markets]
+        accepted = next(((i, result) for i, result in enumerate(evaluations)
+                         if not result["reject"]), None)
+        conflict = False
+        if accepted is None:
+            # Contradictory office evidence is visible for human checking, but
+            # never sent to the LLM or advertised as an eligible location.
+            accepted = next(((i, r) for i, r in enumerate(evaluations)
+                             if r["reject"] and all("location conflict:" in why
+                                                    for why in r["reject"])), None)
+            conflict = accepted is not None
+        if accepted is None:
+            rejected += 1
+            continue
+        idx, evaluation = accepted
+        j.update(evaluation)
+        if j["prefilter_score"] < prefilter_min:
+            continue
+        j["phase"] = per_phase[idx]["name"]
+        per_phase[idx]["kept"] += 1
+        if conflict:
+            j["review_reasons"] = list(j["reject"])
+        eligible.append(j)
+
+    dated = filter_by_age(eligible, max_age, log, verified_only=verified_only,
+                          review=review_jobs)
+    for j in dated:
+        if j.get("review_reasons"):
+            review_jobs.append(j)
+        else:
+            survivors.append(j)
+    freshness_excluded = sum(j.get("freshness", {}).get("status") == "old"
+                             for j in eligible)
 
     for j in survivors:
         j["is_new"] = j["id"] not in seen
-    survivors.sort(key=lambda x: (not x["is_new"], -x["prefilter_score"]))
+    def ordering(j: dict) -> tuple:
+        city = src_mod.fold(j.get("location") or "").lower()
+        return (not j.get("is_new", False), not _has(city, "berlin"), -j["prefilter_score"])
+
+    survivors.sort(key=ordering)
+    review_jobs.sort(key=lambda j: -j.get("prefilter_score", 0))
     tick(f"Checking {len(survivors)} jobs against your CV",
          len(survivors), len(survivors))
 
@@ -1557,10 +1779,13 @@ def run_scan(prefilter_min: float | None = None, limit: int | None = None,
             "sources": len(registry), "fetched": len(all_jobs),
             "rejected": rejected, "survivors": len(survivors),
             "shortlist": len(slim),
+            "review": len(review_jobs), "freshness_excluded": freshness_excluded,
             "new": sum(1 for j in slim if j.get("is_new")),
         },
         "phases": per_phase,
         "jobs": slim,
+        "review_jobs": [{k: v for k, v in j.items() if k != "description"}
+                        for j in review_jobs],
     }
     LAST_PATH.parent.mkdir(parents=True, exist_ok=True)
     LAST_PATH.write_text(json.dumps(payload, indent=2))
@@ -1574,7 +1799,7 @@ def load_last() -> dict:
             return json.loads(LAST_PATH.read_text())
         except ValueError:
             pass
-    return {"generated": "", "counts": {}, "phases": [], "jobs": []}
+    return {"generated": "", "counts": {}, "phases": [], "jobs": [], "review_jobs": []}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1673,6 +1898,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--fresh", action="store_true",
                     help="only what was posted in the last 24h "
                          "(same as --since-days 1)")
+    ap.add_argument("--allow-unverified", action="store_true",
+                    help="explicit broad mode: allow unknown/board/refresh dates")
+    ap.add_argument("--check-url", default="",
+                    help="inspect original publication evidence for a public Greenhouse/Ashby job; no scan or state writes")
     ap.add_argument("--validate", action="store_true",
                     help="check which registry sources respond, then exit")
     ap.add_argument("--discover", default="",
@@ -1682,6 +1911,21 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("-o", "--out", default="",
                     help="write the report here (default: stdout)")
     args = ap.parse_args(argv)
+
+    if args.check_url:
+        try:
+            posting = src_mod.verify_posting_url(args.check_url)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        if posting is None:
+            print("No active public posting found, or source unavailable.", file=sys.stderr)
+            return 1
+        review: list[dict] = []
+        filter_by_age([posting], args.since_days if args.since_days is not None else 7,
+                      verified_only=True, review=review)
+        print(json.dumps({k: v for k, v in posting.items() if k != "description"}, indent=2))
+        return 0
 
     if args.discover:
         rows = src_mod.discover_ats(args.discover)
@@ -1728,7 +1972,8 @@ def main(argv: list[str] | None = None) -> int:
         payload = run_scan(prefilter_min=args.prefilter_min, limit=args.limit,
                            do_llm=not args.prefilter_only,
                            do_rank=args.rank and not args.no_rank, since_days=since,
-                           market=args.market or None)
+                           market=args.market or None,
+                           verified_only=False if args.allow_unverified else None)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -1737,8 +1982,13 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\nfetched {c['fetched']}, rejected {c['rejected']}, "
           f"survivors {c['survivors']}, shortlist {c['shortlist']} "
           f"({c['new']} new)", file=sys.stderr)
+    print(f"review queue: {c.get('review', 0)}; old excluded: "
+          f"{c.get('freshness_excluded', 0)}", file=sys.stderr)
 
     text = report(payload["jobs"], args.min_score, args.prefilter_only)
+    if payload.get("review_jobs"):
+        text += "\n\n# Requires verification (not the active shortlist)\n\n"
+        text += report(payload["review_jobs"], 0, True)
     if args.out:
         p = Path(args.out).expanduser()
         p.parent.mkdir(parents=True, exist_ok=True)

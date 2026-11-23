@@ -754,47 +754,89 @@ function verdictClass(v) {
   return 'v-worth';
 }
 
+function discoveryUrl(value) {
+  try {
+    const url = new URL(value);
+    return ['http:', 'https:'].includes(url.protocol) ? url.href : '';
+  } catch { return ''; }
+}
+
+function discoveryFreshness(j) {
+  const status = ({verified_fresh:'Verified fresh', old:'Older than window',
+    unknown:'Date unknown', unverified:'Unverified original date', future:'Future date',
+    unrestricted:'Freshness not required'})[j.freshness?.status] || 'Date unknown';
+  const basis = ({employer_first_published:'employer first published',
+    employer_date_posted:'employer date posted',
+    employer_last_published:'employer last published (may be a repost)',
+    employer_created:'employer record created', board_posted:'board posted / reposted'})[j.posted_kind]
+    || 'original date unknown';
+  const stack = ({preferred:'Preferred stack',agnostic:'Stack-agnostic',other:'Other stack'})[j.stack_match];
+  return `${status} · ${j.posted || 'date unknown'} · ${basis}${stack ? ' · ' + stack : ''}`;
+}
+
 function DiscoveryPanel({ settings, health }) {
   const [data,   setData]   = useState(null);
   const [status, setStatus] = useState(null);
   const [error,  setError]  = useState('');
+  const [resultError, setResultError] = useState('');
+  const [starting, setStarting] = useState(false);
   const base  = companionUrl(settings);
   const hdrs  = companionHeaders(settings);
+  const token = settings?.companion_token || '';
+  const online = !!health;
   const timer = useRef(null);
+  const active = useRef(false);
 
   const loadResults = useCallback(async () => {
     try {
       const r = await fetch(`${base}/discovery/results`, { headers: hdrs });
-      if (r.ok) setData(await r.json());
-    } catch { /* companion down */ }
-  }, [base]);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const result = await r.json();
+      if (!active.current) return;
+      setData(result);
+      setResultError('');
+    } catch (e) {
+      if (active.current) setResultError(`Results unavailable; displayed list may be stale: ${e.message}`);
+    }
+  }, [base, token]);
 
   const poll = useCallback(async () => {
     try {
       const r = await fetch(`${base}/discovery/status`, { headers: hdrs });
-      if (!r.ok) return;
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const st = await r.json();
+      if (!active.current) return;
       setStatus(st);
-      if (st.error) setError(st.error);
+      setError(st.error || '');
+      if (st.running && !timer.current) timer.current = setInterval(poll, 1500);
       if (!st.running && timer.current) {
         clearInterval(timer.current);
         timer.current = null;
         loadResults();
       }
-    } catch { /* companion down */ }
-  }, [base, loadResults]);
+    } catch (e) {
+      if (active.current) setError(`Scan status unavailable: ${e.message}`);
+    }
+  }, [base, token, loadResults]);
 
   useEffect(() => {
-    if (!health) return;
+    if (!online) return;
+    active.current = true;
     loadResults();
     poll();
-    return () => { if (timer.current) clearInterval(timer.current); };
-  }, [health, loadResults, poll]);
+    return () => {
+      active.current = false;
+      if (timer.current) clearInterval(timer.current);
+      timer.current = null;
+    };
+  }, [online, loadResults, poll]);
 
   const runScan = async () => {
     setError('');
+    setStarting(true);
     try {
-      const r = await fetch(`${base}/discovery/run`,
+      const query = new URLSearchParams({since_days: 7, verified_only: true});
+      const r = await fetch(`${base}/discovery/run?${query}`,
                             { method: 'POST', headers: hdrs });
       if (!r.ok) {
         // Silently swallowing this was why a failed scan looked identical to
@@ -803,12 +845,15 @@ function DiscoveryPanel({ settings, health }) {
         setError(r.status === 409 ? 'A scan is already running'
                : r.status === 401 ? 'Auth token rejected - check Settings'
                : `Scan failed (${r.status}) ${detail.slice(0, 80)}`);
+        if (r.status === 409) poll();
         return;
       }
       setStatus({ running: true, stage: 'starting', done: 0, total: 0 });
-      if (!timer.current) timer.current = setInterval(poll, 1500);
+      if (active.current && !timer.current) timer.current = setInterval(poll, 1500);
     } catch {
       setError('Companion unreachable');
+    } finally {
+      setStarting(false);
     }
   };
 
@@ -820,7 +865,7 @@ function DiscoveryPanel({ settings, health }) {
                  || (b.llm_score ?? 0) - (a.llm_score ?? 0))
     .slice(0, 3);
 
-  const running = status?.running;
+  const running = starting || status?.running;
   const pct = status?.total ? Math.round(100 * status.done / status.total)
                             : (running ? 5 : 0);
 
@@ -836,18 +881,24 @@ function DiscoveryPanel({ settings, health }) {
         </button>
       </div>
 
+      <div class="disc-meta">Explore: verified original publication · last 7 days · configured phases.
+        Berlin preferred; Hamburg, Frankfurt and Munich eligible. Saved phases are not automatically migrated.</div>
+
       ${running && html`
         <div>
-          <div class="disc-meta">${status.stage} ${status.done}/${status.total}</div>
+          <div class="disc-meta">${status?.stage || 'starting'} ${status?.done ?? 0}/${status?.total ?? 0}</div>
           <div class="disc-progress"><i style="width:${pct}%"></i></div>
         </div>`}
 
       ${error && html`
         <div class="disc-empty" style="color:#e05252">${error}</div>`}
+      ${resultError && html`
+        <div class="disc-empty" style="color:#e05252">${resultError}</div>`}
 
-      ${!running && jobs.length === 0 && !error && html`
+      ${!running && jobs.length === 0 && !error && !resultError && html`
         <div class="disc-empty">
-          No results yet. Explore sweeps Germany first, then remote worldwide.
+          ${data?.generated ? 'No accepted matches in the last scan. Check the review queue on the discovery page.'
+                            : 'No results yet. Explore runs a strict seven-day scan.'}
         </div>`}
 
       ${data?.generated && html`
@@ -855,18 +906,28 @@ function DiscoveryPanel({ settings, health }) {
           last scan ${new Date(data.generated).toLocaleString()}
           ${data.counts?.fetched != null
             ? ` · ${data.counts.fetched} scanned` : ''}
-          ${data.counts?.new ? ` · ${data.counts.new} new` : ''}
+          ${data.counts?.new ? ` · ${data.counts.new} newly seen` : ''}
         </div>`}
+
+      ${(data?.review_jobs?.length || data?.counts?.review) > 0 && html`
+        <div class="disc-meta">${data.counts?.review ?? data.review_jobs.length} need date / location verification;
+          separate from accepted matches. Open the discovery page to review.</div>`}
 
       ${jobs.map(j => html`
         <div class="disc-row" key=${j.id}>
           <span class="disc-rank">${j.rank ?? ''}</span>
           <div class="disc-body">
-            <a class="disc-role" href=${j.url} target="_blank" rel="noopener">${j.title}</a>
+            ${discoveryUrl(j.url)
+              ? html`<a class="disc-role" href=${discoveryUrl(j.url)} target="_blank" rel="noopener noreferrer">${j.title}</a>`
+              : html`<span class="disc-role">${j.title}</span>`}
             <div class="disc-meta">
-              ${j.company}${j.location ? ' \u00b7 ' + j.location : ''}
+              ${j.company}${' \u00b7 ' + (j.location || 'Location unknown')}
               ${j.llm_score != null ? ' \u00b7 ' + j.llm_score + '/10' : ''}
             </div>
+            <div class="disc-meta">${discoveryFreshness(j)}</div>
+            ${discoveryUrl(j.posted_source_url) && html`
+              <a class="disc-meta" href=${discoveryUrl(j.posted_source_url)} target="_blank"
+                rel="noopener noreferrer">Publication evidence</a>`}
           </div>
           ${j.verdict && html`
             <span class="disc-verdict ${verdictClass(j.verdict)}">${j.verdict}</span>`}
