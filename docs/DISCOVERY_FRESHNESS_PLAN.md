@@ -55,3 +55,46 @@ User request, 12 November 2026: improve the existing job discovery engine and Ch
 - Shared application policies were updated only for the explicitly expanded
   city scope, stack-agnostic eligibility and StepStone exclusion. Historical
   application documents were not changed.
+
+## Proposed employer-first scan
+
+Poll a curated roster of 15–25 employers with Berlin engineering teams or
+explicit Germany-remote hiring. Start with navigation and embedded systems,
+developer tooling, and applied AI teams. HERE, TomTom, Ableton, Parloa, Langdock
+and Zalando provide starting points. Find smaller employers in the Berlin AI
+directory, then verify each careers URL on the employer site. An EU-remote role
+qualifies when the employer includes Germany as a permitted work location.
+[Berlin AI directory](https://berlin-ai.de/)
+
+1. Extend the employer registry with verified careers URLs and reuse the
+   existing ATS adapters for public feeds. Keep LinkedIn and Indeed as
+   supplemental sources. Flag saved configurations with `max_age_days: 0`,
+   which disables the age cutoff even when strict date verification is enabled.
+2. Use a bounded careers crawl for employers without a usable feed. Prioritise
+   listing pages and requisition URLs, obey robots.txt, and preserve the
+   crawler's host boundary. Hand recognised external ATS links to the existing
+   adapters. Extract job metadata from detail pages before cleaning HTML.
+3. Reconcile records by employer and requisition ID, with a canonical posting
+   URL as a fallback. Retain the earliest observation across aliases. Keep
+   original publication evidence separate from edit, last-publication and
+   first-seen timestamps. Greenhouse `first_published` and a credible employer
+   `JobPosting.datePosted` can establish freshness. Ashby `publishedAt` records
+   the last publication. Send unresolved or conflicting dates to review.
+   [Greenhouse API](https://docs.greenhouse.io/job-board.html) ·
+   [Ashby API](https://developers.ashbyhq.com/docs/public-job-posting-api) ·
+   [JobPosting fields](https://developers.google.com/search/docs/appearance/structured-data/job-posting)
+4. Score C++ systems roles for navigation, SDK, embedded integration and
+   performance evidence. Score applied-AI roles for production retrieval,
+   inference, model integration and evaluation. Check mandatory requirements
+   before recommending a role. A language-agnostic production RAG fixture
+   scored 26.9 against the current prefilter cutoff of 45, below the threshold
+   for résumé scoring.
+
+A three-page crawl of Zalando's engineering listings surfaced 173 job-shaped
+URLs in the site map and spent its fetch budget on other pages. Test careers
+prioritisation with a similarly small budget. Also test a refreshed board copy
+of an old requisition, an EU-remote role restricted to another country, and a
+language-agnostic applied-AI role with strong candidate evidence. During the
+pilot, track verified fresh matches, dated coverage by employer and the first
+observation on each source to measure any lead over the boards checked.
+[Zalando engineering listings](https://jobs.zalando.com/en/jobs?category=Software+Engineering)
